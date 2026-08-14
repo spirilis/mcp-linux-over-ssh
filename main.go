@@ -1,8 +1,11 @@
 // Command mcp-linux-over-ssh is a stdio-only MCP server (protocol 2026-07-28) that runs
-// commands on a remote host through one persistent SSH shell session.
+// commands on remote hosts through persistent SSH shell sessions.
 //
-// See PLAN.md for why the session is persistent rather than one SSH invocation per
-// command, and CLAUDE.md for the architecture that follows from it.
+// Sessions are opened on demand by the start_session tool rather than at startup: the
+// target is chosen per connection from parameters the config declares, and several
+// independent sessions can be live at once. See PLAN.md for why each session is a
+// persistent shell rather than one SSH invocation per command, and CLAUDE.md for the
+// architecture that follows from it.
 package main
 
 import (
@@ -29,18 +32,29 @@ import (
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.1.0"
+	serverVersion = "0.2.0"
 
-	// stdio has no natural URI scheme for server-local resources, so invent one, as the
-	// library's UNIX-socket example does with mcp+unix://.
-	statusURI     = "mcp+stdio:///session/status"
-	transcriptURI = "mcp+stdio:///session/transcript"
+	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
+	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
+	// loses a pair of entries with every session, and a client caching the list that long
+	// would not see a session it had just opened.
+	listTTLMs = 5000
 )
 
 func main() {
 	configPath := pflag.String("config", "", "Path to the YAML configuration file (required)")
 	logLevel := pflag.String("log-level", "", "Override logging.level from the config file")
+	helpConfig := pflag.Bool("help-config", false, "Print annotated example configurations and exit")
 	pflag.Parse()
+
+	// Checked before --config is required, since not having one yet is the whole reason to
+	// ask. Writing to stdout does not break the "nothing may write to stdout" rule: that
+	// rule protects the JSON-RPC framing, and this path returns before the transport
+	// exists. Help a user explicitly asked for belongs on stdout so it can be piped.
+	if *helpConfig {
+		fmt.Print(config.HelpConfig())
+		return
+	}
 
 	if *configPath == "" {
 		fmt.Fprintln(os.Stderr, "--config is required")
@@ -90,9 +104,9 @@ func main() {
 		logging.Warn("require_confirmation defaulted to false because legacy MCP compatibility is enabled and MRTR confirmation cannot reach a pre-2026-07-28 client; set require_confirmation explicitly in the config to override")
 	}
 
-	sess, err := session.New(session.Config{
-		Command:         cfg.SSH.Command,
-		PromptRegex:     cfg.SSH.PromptRegex,
+	// Everything that is not per-connection. start_session fills in Command and
+	// PromptRegex by rendering cfg.Renderer against the values it was called with.
+	baseSession := session.Config{
 		LoginTimeout:    cfg.SSH.LoginTimeout,
 		CommandTimeout:  cfg.SSH.CommandTimeout,
 		RecoveryTimeout: cfg.SSH.RecoveryTimeout,
@@ -104,24 +118,27 @@ func main() {
 		MaxOutputBytes:  cfg.SSH.MaxOutputBytes,
 		TranscriptBytes: cfg.SSH.TranscriptBytes,
 		AllowReconnect:  cfg.SSH.AllowReconnect,
-	})
-	if err != nil {
-		logging.Error("invalid session configuration", "error", err)
-		os.Exit(1)
 	}
-	defer sess.Close()
 
-	registry := mcp.NewToolRegistry()
-	registry.Register(tools.NewRunBash(sess, requireConfirmation))
-	registry.Register(tools.NewTunePromptRegex(sess))
+	mgr := session.NewManager(cfg.SSH.MaxSessions, cfg.SSH.IdleTimeout)
+	defer mgr.CloseAll()
 
 	resourceRegistry := mcp.NewResourceRegistry()
-	registerResources(resourceRegistry, sess)
+	registerSessionsIndex(resourceRegistry, mgr)
 
+	registry := mcp.NewToolRegistry()
+	registry.Register(tools.NewStartSession(mgr, cfg.Renderer, baseSession))
+	registry.Register(tools.NewListSessions(mgr))
+	registry.Register(tools.NewEndSession(mgr))
+	registry.Register(tools.NewRunBash(mgr, requireConfirmation))
+	registry.Register(tools.NewTunePromptRegex(mgr))
+
+	listTTL := int64(listTTLMs)
 	serverCfg := &mcp.ServerConfig{
 		Name:         serverName,
 		Version:      serverVersion,
-		Instructions: instructions(requireConfirmation),
+		Instructions: instructions(requireConfirmation, cfg.Renderer.Parametric()),
+		ListTTLMs:    &listTTL,
 	}
 	if compatEnabled {
 		// Feed server/discover, the legacy initialize diagnostic, and -32022 from one
@@ -132,20 +149,42 @@ func main() {
 	server := mcp.NewServer(registry, resourceRegistry, serverCfg)
 
 	// After NewServer, which is what attaches the registry to the notification broker: a
-	// NotifyUpdated on a detached registry reaches nobody. The session only changes state
-	// from the reader goroutine or a tool call, and installing the observer before the
-	// session is spawned below means subscribers see the login handshake's own state
-	// transitions instead of missing all of them.
-	sess.SetStatusObserver(func(st session.Status) {
-		// busy/ready is two lines per command and tells an operator nothing; the states
-		// worth waking up for are the ones that need a human or a repair.
-		if st.State == session.StateBusy.String() || st.State == session.StateReady.String() {
-			logging.Debug("session status changed", "state", st.State, "commands_run", st.CommandsRun)
-		} else {
-			logging.Info("session status changed", "state", st.State, "last_error", st.LastError)
-		}
-		resourceRegistry.NotifyUpdated(statusURI)
-	})
+	// NotifyUpdated on a detached registry reaches nobody. Sessions are created by tool
+	// calls, which cannot arrive until the transport is serving, so this is comfortably
+	// early enough — but it must precede the first start_session either way, since a
+	// session that joined without it would never announce anything.
+	mgr.SetLifecycleObserver(
+		func(id string, sess *session.Session) {
+			// Registered before the observer is installed, so no notification can be
+			// aimed at a URI the registry does not know yet. Both run before the login
+			// handshake begins, which is what lets a subscriber watch that handshake's
+			// own transitions rather than missing all of them.
+			registerSessionResources(resourceRegistry, id, sess)
+
+			statusURI := tools.StatusURI(id)
+			sess.SetStatusObserver(func(st session.Status) {
+				// busy/ready is two lines per command and tells an operator nothing; the
+				// states worth waking up for are the ones that need a human or a repair.
+				if st.State == session.StateBusy.String() || st.State == session.StateReady.String() {
+					logging.Debug("session status changed", "session_id", id, "state", st.State, "commands_run", st.CommandsRun)
+				} else {
+					logging.Info("session status changed", "session_id", id, "state", st.State, "last_error", st.LastError)
+				}
+				resourceRegistry.NotifyUpdated(statusURI)
+				// The index carries every session's state, so it changed too. A client
+				// watching the collection rather than one session is the likelier case
+				// now that ids are not known ahead of time.
+				resourceRegistry.NotifyUpdated(tools.SessionsURI)
+			})
+		},
+		func(id string) {
+			// Unregistering fires resources/list_changed; the session's own final "dead"
+			// update has already gone out, because Manager.End closes before it removes.
+			resourceRegistry.Unregister(tools.StatusURI(id))
+			resourceRegistry.Unregister(tools.TranscriptURI(id))
+			resourceRegistry.NotifyUpdated(tools.SessionsURI)
+		},
+	)
 
 	// Wrap server in the legacy-compat overlay, not the other way around: the overlay
 	// translates a pre-2026-07-28 request into the modern wire shape and forwards it to
@@ -165,39 +204,26 @@ func main() {
 	// the client close it. Closing stdin is the spec's shutdown signal for a stdio server,
 	// but the transport reads os.Stdin directly and its Stop cannot interrupt a blocked
 	// read (transport/stdio.go says as much), so without this the server outlives its
-	// client — a `docker run -i` would sit there forever holding the SSH session open.
+	// client — a `docker run -i` would sit there forever holding its SSH sessions open.
 	stdinClosed := watchStdin()
 
 	trans := transport.NewStdioTransport()
 	if err := trans.Start(handler); err != nil {
 		logging.Error("error starting transport", "error", err)
-		// os.Exit skips the deferred Close, and the shell is already spawned by now.
-		// Leaving it to die of PTY hangup is not good enough here: the thing on the other
-		// end is a privileged bastion session, and a process that ignores SIGHUP would
-		// outlive us holding it open.
-		_ = sess.Close()
+		// os.Exit skips the deferred CloseAll. Nothing can be open this early — sessions
+		// only exist once a tool call has asked for one, and none can have arrived — but
+		// the call costs nothing and keeps the invariant local rather than dependent on
+		// that argument staying true.
+		mgr.CloseAll()
 		os.Exit(1)
 	}
 
-	// The SSH login handshake runs after the transport is already serving requests, not
-	// before it. An MCP client's own connect timeout is commonly much shorter than
-	// login_timeout, and a bastion login is exactly the kind of thing that can take a
-	// while (banners, MFA, PAM dispatch) — blocking the transport on it made every slow
-	// login look like a dead server. Tool calls that land before the handshake finishes
-	// already fail cleanly through checkRunnable (StateStarting/StateAwaitingPrompt), so
-	// there is nothing left for a stricter ordering to protect against.
-	go func() {
-		if err := sess.Start(context.Background()); err != nil {
-			logging.Error("could not start the shell session", "error", err)
-			_ = trans.Stop()
-			_ = sess.Close()
-			os.Exit(1)
-		}
-	}()
-
 	logging.Info("MCP server ready on stdio",
 		"require_confirmation", requireConfirmation,
-		"legacy_compat", compatEnabled)
+		"legacy_compat", compatEnabled,
+		"max_sessions", cfg.SSH.MaxSessions,
+		"idle_timeout", cfg.SSH.IdleTimeout,
+		"parameters", len(cfg.Renderer.Parameters()))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -216,13 +242,11 @@ func main() {
 	if err := trans.Stop(); err != nil {
 		logging.Error("error stopping transport", "error", err)
 	}
-	// Closed here rather than left to the defer at the top so the SSH session is actually
-	// gone before "shutdown complete" claims it is. The defer stays for the paths this
-	// line cannot cover, a panic above it chief among them; death is announced once, so
-	// the second call is a no-op.
-	if err := sess.Close(); err != nil {
-		logging.Error("error closing session", "error", err)
-	}
+	// Closed here rather than left to the defer at the top so the SSH sessions are
+	// actually gone before "shutdown complete" claims it. The defer stays for the paths
+	// this line cannot cover, a panic above it chief among them; a session announces its
+	// death once, so the second pass is a no-op.
+	mgr.CloseAll()
 	logging.Info("shutdown complete")
 }
 
@@ -321,11 +345,38 @@ func watchStdin() <-chan struct{} {
 	return done
 }
 
-func registerResources(reg *mcp.ResourceRegistry, sess *session.Session) {
+// registerSessionsIndex publishes the collection of open sessions.
+//
+// It is registered for the process lifetime, unlike the per-session pair, and that is
+// load-bearing rather than cosmetic: mcp.Server advertises a resources capability only when
+// the registry is non-empty (it checks HasResources when building its capabilities), so a
+// server whose only resources came and went with sessions would tell a client at startup —
+// when nothing is open — that it serves no resources at all. A client that caches
+// capabilities from its first handshake, which every pre-2026-07-28 client does, would
+// never look again.
+func registerSessionsIndex(reg *mcp.ResourceRegistry, mgr *session.Manager) {
 	reg.Register(mcp.Resource{
-		URI:         statusURI,
-		Name:        "Session Status",
-		Description: "State of the persistent SSH shell session: whether it is alive and at a prompt, the prompt regex in effect, whether sentinel framing is available, and how many commands have run.",
+		URI:  tools.SessionsURI,
+		Name: "Open SSH Sessions",
+		Description: "Every SSH session currently open on this server: its id, the command that opened it, the parameters it was opened with, and its live state. " +
+			"The same information the list_sessions tool returns.",
+		MimeType: "application/json",
+	}, func(context.Context) (mcp.ResourceContentResult, error) {
+		b, err := json.MarshalIndent(mgr.List(), "", "  ")
+		if err != nil {
+			return mcp.ResourceContentResult{}, err
+		}
+		return mcp.ResourceContentResult{Text: string(b)}, nil
+	})
+}
+
+// registerSessionResources publishes one session's status and transcript, under URIs
+// carrying its id. Both are unregistered when the session ends.
+func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *session.Session) {
+	reg.Register(mcp.Resource{
+		URI:         tools.StatusURI(id),
+		Name:        "Session " + id + " Status",
+		Description: "State of SSH session " + id + ": whether it is alive and at a prompt, the command that opened it, the prompt regex in effect, whether sentinel framing is available, and how many commands have run.",
 		MimeType:    "application/json",
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
 		b, err := json.MarshalIndent(sess.Status(), "", "  ")
@@ -336,9 +387,9 @@ func registerResources(reg *mcp.ResourceRegistry, sess *session.Session) {
 	})
 
 	reg.Register(mcp.Resource{
-		URI:  transcriptURI,
-		Name: "Session Transcript",
-		Description: "Recent raw bytes emitted by the remote shell, escape sequences intact, for diagnosing a prompt regex that does not match. " +
+		URI:  tools.TranscriptURI(id),
+		Name: "Session " + id + " Transcript",
+		Description: "Recent raw bytes emitted by SSH session " + id + "'s remote shell, escape sequences intact, for diagnosing a prompt regex that does not match. " +
 			"WARNING: this is verbatim terminal output and may contain command output, hostnames, or secrets that were printed to the shell.",
 		MimeType: "text/plain",
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
@@ -346,11 +397,16 @@ func registerResources(reg *mcp.ResourceRegistry, sess *session.Session) {
 	})
 }
 
-func instructions(requireConfirmation bool) string {
-	s := "Runs commands on a remote host through a single persistent SSH shell session. " +
-		"Because that one shell is shared, commands execute strictly one at a time and shell state (working directory, exported variables) persists between calls. " +
-		"If run_bash reports that the prompt regex has not matched, read the mcp+stdio:///session/transcript resource to see what the shell printed and repair the pattern with tune_prompt_regex; " +
-		"mcp+stdio:///session/status reports the session's current state."
+func instructions(requireConfirmation, parametric bool) string {
+	s := "Runs commands on remote hosts through persistent SSH shell sessions. " +
+		"Nothing is connected when this server starts: call start_session to open a session and get its id, pass that id to run_bash for every command, and call end_session when finished. " +
+		"Sessions are capped, and each one is a real privileged login held open on the remote side, so end them rather than abandoning them. "
+	if parametric {
+		s += "start_session's arguments choose which host the session connects to; they are validated against patterns the operator configured. "
+	}
+	s += "A session takes a moment to log in — list_sessions reports each session's state, and only \"ready\" can run commands, though a command sent early fails harmlessly. " +
+		"Each session is one shell running one command at a time, so working directory and exported variables persist across calls on the same id and are independent between ids. " +
+		"If a session reports state \"awaiting_prompt\", or run_bash says the prompt regex has not matched, read that session's transcript resource to see what the shell printed and repair the pattern with tune_prompt_regex."
 	if requireConfirmation {
 		s += " Every run_bash call requires the caller to confirm the exact command via an elicitation round trip before it executes — clients must declare the elicitation capability."
 	}

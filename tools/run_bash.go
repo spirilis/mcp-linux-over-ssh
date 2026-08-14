@@ -14,7 +14,8 @@ import (
 
 // RunBashArguments is the run_bash input.
 type RunBashArguments struct {
-	Cmd string `json:"cmd"`
+	SessionID string `json:"session_id"`
+	Cmd       string `json:"cmd"`
 }
 
 // confirmSchema is the shape of the client's answer to the "may I run this?" elicitation.
@@ -26,14 +27,18 @@ var confirmSchema = json.RawMessage(`{
 	"required": ["confirm"]
 }`)
 
-// NewRunBash builds the run_bash tool against sess.
+// NewRunBash builds the run_bash tool over mgr's sessions.
+//
+// The session is resolved per call rather than captured at construction: which host a
+// command runs on is now the caller's choice, made by session_id, and the set of open
+// sessions changes underneath this tool for its whole life.
 //
 // When requireConfirmation is set, the destructive-command warning in the description is
 // enforced rather than merely stated: the first call to run_bash returns input_required and
 // nothing executes until the caller retries with an accepted confirmation of that exact
 // command. Clients that have not declared the elicitation capability cannot use the tool at
 // all in that mode.
-func NewRunBash(sess *session.Session, requireConfirmation bool) (mcp.Tool, mcp.ToolFunction) {
+func NewRunBash(mgr *session.Manager, requireConfirmation bool) (mcp.Tool, mcp.ToolFunction) {
 	return runBashDefinition(requireConfirmation), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		var args RunBashArguments
 		if err := req.BindArguments(&args); err != nil {
@@ -43,6 +48,11 @@ func NewRunBash(sess *session.Session, requireConfirmation bool) (mcp.Tool, mcp.
 			return mcp.ErrorResultf("cmd argument is required"), nil
 		}
 
+		sess, err := resolveSession(mgr, strings.TrimSpace(args.SessionID))
+		if err != nil {
+			return mcp.ErrorResultf("%v", err), nil
+		}
+
 		if requireConfirmation {
 			if !req.ClientCapabilities.HasElicitation() {
 				return mcp.ErrorResultf("this tool requires user confirmation before executing any command, which requires elicitation support that the client did not declare"), nil
@@ -50,9 +60,13 @@ func NewRunBash(sess *session.Session, requireConfirmation bool) (mcp.Tool, mcp.
 
 			answer, asked := req.ElicitResponse("confirm")
 			if !asked {
+				// Which host is now a per-call choice, so the confirmation names it. A
+				// prompt that only showed the command would be asking the user to approve
+				// half the decision.
 				return req.NeedInput(mcp.InputRequests{
 					"confirm": mcp.NewElicitRequest("form",
-						fmt.Sprintf("Execute this command on the remote host?\n\n%s", args.Cmd),
+						fmt.Sprintf("Execute this command on session %s (%s)?\n\n%s",
+							args.SessionID, sess.Status().Command, args.Cmd),
 						confirmSchema),
 				})
 			}
@@ -114,11 +128,12 @@ func structuredResult(res *session.Result) map[string]any {
 }
 
 func runBashDefinition(requireConfirmation bool) mcp.Tool {
-	desc := "Executes a shell command on the remote host over a persistent SSH session and returns its output and exit code. " +
+	desc := "Executes a shell command on the remote host of an open SSH session and returns its output and exit code. " +
+		"Requires a session_id from start_session; call list_sessions if you do not have one, and check that the session's state is \"ready\" first. " +
 		"WARNING: Do NOT use this tool for destructive commands or operations that may overwrite files without explicit user consent. " +
-		"Commands run one at a time in a single shared shell, so state such as the working directory and exported variables persists between calls. " +
+		"Each session is one shell running commands one at a time, so state such as the working directory and exported variables persists between calls on the same session_id — and is entirely separate between different session_ids. " +
 		"Do not run interactive or full-screen programs (vim, top, less, or anything that reads stdin) — they will hang until the command timeout and force a session resynchronisation. " +
-		"Never run anything that terminates the shell itself (exit, logout, kill on its own PID): that shell IS the session, the underlying SSH command cannot be re-run, and ending it makes this server unusable until it is restarted. " +
+		"Never run anything that terminates the shell itself (exit, logout, kill on its own PID): that shell IS the session, its SSH command cannot be re-run, and ending it kills the session for good — use end_session to close one deliberately. " +
 		"To get a non-zero status without leaving the shell, use a subshell such as (exit 3)."
 	if requireConfirmation {
 		desc += " Every call requires the user to explicitly confirm the exact command before it runs — the tool will pause and ask."
@@ -132,12 +147,16 @@ func runBashDefinition(requireConfirmation bool) mcp.Tool {
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
+				"session_id": {
+					"type": "string",
+					"description": "Which open session to run the command on, as returned by start_session or list_sessions"
+				},
 				"cmd": {
 					"type": "string",
 					"description": "The shell command to execute on the remote host"
 				}
 			},
-			"required": ["cmd"]
+			"required": ["session_id", "cmd"]
 		}`),
 		OutputSchema: json.RawMessage(`{
 			"type": "object",

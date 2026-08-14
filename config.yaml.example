@@ -2,6 +2,10 @@
 #
 # This one file feeds two parsers: generic-go-mcp reads server: and logging:, and this
 # server reads ssh:.
+#
+# Nothing connects when this server starts. The ssh: block below is a template for the
+# sessions an MCP client opens on demand with the start_session tool; several can be live
+# at once, each an independent SSH login.
 
 server:
   # stdio is the only mode this server supports.
@@ -34,19 +38,65 @@ logging:
   # file: /var/log/mcp-linux-over-ssh.log
 
 ssh:
-  # The command that opens the session, run once via `sh -c` for the process lifetime.
-  # It is never re-run per tool call — that constraint is the reason this server exists.
-  # Use -tt to force a TTY: the shell only prints a prompt when it thinks it is
-  # interactive, and prompt detection is what frames the session.
-  command: "ssh -tt psmuser@bastion.example.com"
+  # The command that opens a session, run via `sh -c`. Each session runs it exactly once
+  # and keeps that shell for as long as the session lives; it is never re-run per tool
+  # call, which is the constraint this whole server is built around. Use -tt to force a
+  # TTY: the shell only prints a prompt when it thinks it is interactive, and prompt
+  # detection is what frames the session.
+  #
+  # This is a Go text/template, rendered per session against the values start_session was
+  # called with (see parameters: below). Declare no parameters and it is simply a constant.
+  #
+  # SECURITY: this string is handed to `sh -c` on the machine running this server, not on
+  # the bastion. What a parameter is allowed to interpolate into it is therefore the
+  # difference between choosing a target and choosing a command — see pattern: below.
+  command: "ssh -tt {{.user}}@{{.host}}"
 
   # Go (RE2) regex matching the remote shell's prompt. It frames login and backstops
   # recovery. Getting this wrong is the most common failure: the session then starts in
-  # the awaiting_prompt state rather than dying, so read the
-  # mcp+stdio:///session/transcript resource and repair it with the tune_prompt_regex
+  # the awaiting_prompt state rather than dying, so read that session's
+  # mcp+stdio:///session/<id>/transcript resource and repair it with the tune_prompt_regex
   # tool. Output is stripped of ANSI escapes and CRLF-normalised before matching, so
   # write the pattern against the text a human would see.
-  prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+  #
+  # Also a template, so a prompt that embeds the target's own hostname or username can be
+  # matched exactly. A templated pattern can only be compiled once rendered, so a broken
+  # one surfaces as a start_session error rather than at startup; with no parameters
+  # declared it is still checked when the config loads.
+  prompt_regex: '(?m)^\[{{.user}}@[^\]]+\][$#]\s*$'
+
+  # The values start_session accepts. Each becomes a required, described property on
+  # start_session's generated input schema, so a client sees them in tools/list without a
+  # separate discovery call. Omit this block entirely for a single fixed target.
+  parameters:
+    - parameter: host
+      description: "Hostname of the bastion to connect through"
+      # Go (RE2) regex every supplied value must match in full. Omitted means
+      # ^[A-Za-z0-9._@:/+-]{1,256}$ — hostnames, usernames, IPs, paths and ports, and
+      # nothing that carries meaning to a shell.
+      #
+      # Keep this tight. These values come from an MCP client rather than from you, and
+      # they are interpolated into command: above, which runs locally. If you genuinely
+      # need to accept spaces or metacharacters, widen the pattern AND wrap the reference
+      # in shquote, which renders a value as a single safely-quoted shell word:
+      #     command: "ssh -tt {{.user}}@{{.host}} -- {{shquote .remote_arg}}"
+      # Use it bare, never inside quotes of your own — it supplies its own.
+    - parameter: user
+      description: "PSM-crafted username encoding the target system"
+      pattern: '^[a-z][a-z0-9_-]{0,63}$'
+
+  # How many sessions may be open at once. start_session refuses past this. Sessions that
+  # have died do not count, so an unreachable target cannot wedge the server.
+  max_sessions: 8
+
+  # Close sessions that have gone this long without running a command. Omitted (or 0s)
+  # never reaps, which is the default: on a PAM/PSM bastion, tearing down a privileged
+  # session someone is still reasoning about is worse than keeping an idle one, and a
+  # stdio server's sessions are already bounded by the life of its client. A session
+  # running a command, or still logging in, is never reaped regardless.
+  #
+  # Like every duration here it must be written as a string with a unit — 30m, not 30.
+  # idle_timeout: 30m
 
   # How long to wait for the first prompt after the command starts. Allow for banners,
   # MFA, and whatever dispatching the bastion does.
@@ -67,15 +117,16 @@ ssh:
   cols: 500
   rows: 24
 
-  # Run once after login, before the session is declared ready. `stty -echo` is the clean
-  # fix for command echo; output framing tolerates echo either way.
+  # Run in each session after login, before it is declared ready. `stty -echo` is the
+  # clean fix for command echo; output framing tolerates echo either way.
   init_commands:
     - "stty -echo"
     - "unset PROMPT_COMMAND"
 
   # Wrap each command with an end marker carrying $?, giving exact framing and a real
-  # exit code. Support is probed at startup; a shell that cannot do it falls back to
-  # prompt-only framing automatically. Set false to skip the probe entirely.
+  # exit code. Support is probed once per session during its login; a shell that cannot do
+  # it falls back to prompt-only framing automatically, for that session alone. Set false
+  # to skip the probe entirely.
   use_sentinel: true
 
   # Cap on returned output. The command is still consumed in full — only what is handed

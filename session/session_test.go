@@ -9,17 +9,10 @@ import (
 	"time"
 )
 
-// These exercise the real spawn/PTY/handshake/execute path against a local interactive
-// shell. `bash -i` behaves like the remote shell the server actually talks to — it is a
-// PTY session that prints a prompt and echoes — so it covers the same code with no bastion
-// in the loop. Skipped under -short.
-func newTestSession(t *testing.T, mutate func(*Config)) *Session {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping shell integration test in short mode")
-	}
-
-	cfg := Config{
+// testConfig is the baseline every shell-backed test starts from, shared with the manager
+// tests so the two cannot drift into exercising different shells.
+func testConfig() Config {
+	return Config{
 		Command:         "bash --norc --noprofile -i",
 		PromptRegex:     `(?m)^[^\n]*[$#]\s*$`,
 		LoginTimeout:    20 * time.Second,
@@ -33,6 +26,19 @@ func newTestSession(t *testing.T, mutate func(*Config)) *Session {
 		MaxOutputBytes:  1 << 20,
 		TranscriptBytes: 64 << 10,
 	}
+}
+
+// These exercise the real spawn/PTY/handshake/execute path against a local interactive
+// shell. `bash -i` behaves like the remote shell the server actually talks to — it is a
+// PTY session that prints a prompt and echoes — so it covers the same code with no bastion
+// in the loop. Skipped under -short.
+func newTestSession(t *testing.T, mutate func(*Config)) *Session {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping shell integration test in short mode")
+	}
+
+	cfg := testConfig()
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -465,5 +471,48 @@ func TestDeathIsAnnouncedOnceWithItsOriginalCause(t *testing.T) {
 func TestSessionRejectsBadPromptRegex(t *testing.T) {
 	if _, err := New(Config{Command: "true", PromptRegex: "([unclosed"}); err == nil {
 		t.Error("expected New to reject a prompt regex that does not compile")
+	}
+}
+
+// Manager.Start splits Start in two so that spawning — fast, and failing for reasons the
+// caller can act on — is synchronous while the login handshake is not. The halves have to
+// compose back into what Start does, and the gap between them has to be safe: start_session
+// hands out an id while the session is still in it.
+func TestSessionSpawnThenHandshakeComposesToStart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping shell integration test in short mode")
+	}
+
+	sess, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sess.Spawn(); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+
+	if got := sess.Status().State; got != StateStarting.String() {
+		t.Errorf("state after Spawn = %q, want %q", got, StateStarting)
+	}
+	// A command arriving in the gap is the normal case, not an exotic one: start_session
+	// returns before the login finishes, so a model that skips the readiness check lands
+	// here. It must be told to wait, not left holding a corrupted session.
+	if _, err := sess.Execute(context.Background(), "echo early"); !errors.Is(err, ErrNotReady) {
+		t.Errorf("Execute before the handshake returned %v, want it to wrap ErrNotReady", err)
+	}
+
+	sess.Handshake(context.Background())
+
+	if got := sess.Status().State; got != StateReady.String() {
+		t.Fatalf("state after Handshake = %q, want %q (transcript: %q)",
+			got, StateReady, sess.Transcript(2048))
+	}
+	res, err := sess.Execute(context.Background(), "echo composed")
+	if err != nil {
+		t.Fatalf("Execute after the handshake: %v", err)
+	}
+	if !strings.Contains(res.Output, "composed") {
+		t.Errorf("output = %q, want it to contain composed", res.Output)
 	}
 }

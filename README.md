@@ -1,13 +1,17 @@
 # mcp-linux-over-ssh
 
-A stdio-only MCP server (protocol `2026-07-28`) that runs commands on a remote host
-through a single, long-lived SSH shell session.
+A stdio-only MCP server (protocol `2026-07-28`) that runs commands on remote hosts
+through long-lived SSH shell sessions.
 
 It's built for targets where the SSH command can only be run once — a PAM/PSM bastion
 that dispatches on a specially-crafted username, where multiplexing isn't available —
 but it works against any remote shell reachable over SSH. See [PLAN.md](PLAN.md) for the
 constraint that drives the design, and [CLAUDE.md](CLAUDE.md) for the architecture that
 follows from it.
+
+Sessions are opened on demand rather than at startup, and which host a session connects
+to is chosen per connection from parameters the config declares, so one server can serve
+several targets at once.
 
 ## Install
 
@@ -29,7 +33,14 @@ automatically.
 
 ## Usage
 
-Copy the example config and point it at your target:
+Start from a worked example — `--help-config` prints terse configurations for a fixed
+target, a caller-chosen host, and a caller-chosen account and host:
+
+```
+mcp-linux-over-ssh --help-config
+```
+
+Or copy the fully commented one and point it at your target:
 
 ```
 cp config.yaml.example config.yaml
@@ -47,14 +58,41 @@ than run interactively. For local development without a real bastion, point
 `ssh.command` at `bash --norc --noprofile -i` — it's a PTY session that prints a prompt
 and echoes, exercising the same code path.
 
-See `config.yaml.example` for the full set of options, and the `session/transcript`
-resource plus the `tune_prompt_regex` tool for repairing a prompt regex that doesn't
-match your shell, in place, without restarting.
+### Tools
 
-A client that subscribes to `mcp+stdio:///session/status` via `subscriptions/listen` is
-sent `notifications/resources/updated` whenever the session changes — it goes busy and
-ready around each command, records a new prompt regex, or dies — so the session's state
-can be followed without polling.
+Nothing is connected when the server starts.
+
+| Tool | Purpose |
+| --- | --- |
+| `start_session` | Opens a session and returns its id. Its input schema is generated from `ssh.parameters`, so the declared parameters appear in `tools/list` with their descriptions. Returns as soon as the shell is spawned, without waiting for the login. |
+| `list_sessions` | Every open session, its state, and the parameters it was opened with. This is both the readiness check and the way back to an id you've lost. |
+| `run_bash` | Runs a command on the session named by `session_id`. |
+| `tune_prompt_regex` | Repairs one session's prompt regex in place, without restarting. |
+| `end_session` | Closes a session and frees its slot. |
+
+Each session is one shell running one command at a time, so working directory and
+exported variables persist across calls on the same id and are independent between ids.
+
+### Parameters and safety
+
+`ssh.command` and `ssh.prompt_regex` are Go `text/template`s rendered per session. Because
+the rendered command reaches `sh -c` on the machine running this server, every parameter
+value must match a regex — `^[A-Za-z0-9._@:/+-]{1,256}$` unless the config sets its own
+`pattern:` — and a `{{shquote .x}}` function is available for values that need to be
+looser. Declaring no parameters leaves the templates as constants.
+
+`ssh.max_sessions` caps concurrent sessions (default 8); `ssh.idle_timeout` optionally
+reaps idle ones and is off by default.
+
+See `config.yaml.example` for the full set of options, and each session's
+`mcp+stdio:///session/<id>/transcript` resource plus the `tune_prompt_regex` tool for
+repairing a prompt regex that doesn't match your shell.
+
+A client that subscribes to `mcp+stdio:///session/<id>/status` via `subscriptions/listen`
+is sent `notifications/resources/updated` whenever that session changes — it goes busy and
+ready around each command, records a new prompt regex, or dies — so a session's state can
+be followed without polling. `mcp+stdio:///sessions` lists them all and is registered for
+the process lifetime.
 
 ## License
 

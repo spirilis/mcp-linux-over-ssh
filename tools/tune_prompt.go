@@ -13,11 +13,12 @@ import (
 
 // TunePromptArguments is the tune_prompt_regex input.
 type TunePromptArguments struct {
-	Regex string `json:"regex"`
-	Apply bool   `json:"apply"`
+	SessionID string `json:"session_id"`
+	Regex     string `json:"regex"`
+	Apply     bool   `json:"apply"`
 }
 
-// NewTunePromptRegex builds the tool that lets the caller repair the prompt regex at
+// NewTunePromptRegex builds the tool that lets the caller repair a session's prompt regex at
 // runtime.
 //
 // Screen-scraping a shell hinges entirely on recognising its prompt, and a regex written
@@ -25,7 +26,11 @@ type TunePromptArguments struct {
 // tool with the session transcript resource turns that from a restart-and-guess loop into
 // something the model can resolve in place: read what the shell actually printed, test a
 // pattern against it, then apply the one that matches.
-func NewTunePromptRegex(sess *session.Session) (mcp.Tool, mcp.ToolFunction) {
+//
+// The regex is a property of one running session, not of the process: ssh.prompt_regex is
+// itself a template, so two sessions opened against different hosts can legitimately need
+// different patterns, and repairing one must not disturb the other.
+func NewTunePromptRegex(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
 	return tunePromptDefinition(), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		var args TunePromptArguments
 		if err := req.BindArguments(&args); err != nil {
@@ -33,6 +38,11 @@ func NewTunePromptRegex(sess *session.Session) (mcp.Tool, mcp.ToolFunction) {
 		}
 		if strings.TrimSpace(args.Regex) == "" {
 			return mcp.ErrorResultf("regex argument is required"), nil
+		}
+
+		sess, err := resolveSession(mgr, strings.TrimSpace(args.SessionID))
+		if err != nil {
+			return mcp.ErrorResultf("%v", err), nil
 		}
 
 		matches, err := sess.TestPromptRegex(args.Regex, 10)
@@ -43,7 +53,7 @@ func NewTunePromptRegex(sess *session.Session) (mcp.Tool, mcp.ToolFunction) {
 		var b strings.Builder
 		if len(matches) == 0 {
 			b.WriteString("The regex compiles but matches nothing in the retained transcript.\n")
-			b.WriteString("Read the mcp+stdio:///session/transcript resource to see what the shell actually printed.\n")
+			fmt.Fprintf(&b, "Read the %s resource to see what the shell actually printed.\n", TranscriptURI(args.SessionID))
 		} else {
 			fmt.Fprintf(&b, "The regex matched %d place(s) in the retained transcript:\n", len(matches))
 			for _, m := range matches {
@@ -95,14 +105,19 @@ func tunePromptDefinition() mcp.Tool {
 	return mcp.Tool{
 		Name:  "tune_prompt_regex",
 		Title: "Tune Shell Prompt Regex",
-		Description: "Tests, and optionally installs, the regular expression this server uses to recognise the remote shell's prompt. " +
-			"Use it when run_bash reports that the prompt regex has not matched, or when the session is stuck: read the " +
-			"mcp+stdio:///session/transcript resource to see what the shell actually printed, then test a Go (RE2) regex against it here. " +
+		Description: "Tests, and optionally installs, the regular expression one session uses to recognise its remote shell's prompt. " +
+			"Use it when a session is stuck in the awaiting_prompt state or run_bash reports that the prompt regex has not matched: read that session's " +
+			"transcript resource (mcp+stdio:///session/<session_id>/transcript, shown by list_sessions) to see what the shell actually printed, then test a Go (RE2) regex against it here. " +
 			"With apply set to false the tool only reports what the pattern would match. With apply set to true it installs the pattern and " +
-			"resynchronises the session, which is what promotes a session out of the awaiting_prompt state.",
+			"resynchronises the session, which is what promotes a session out of the awaiting_prompt state. " +
+			"The change affects only the named session; other open sessions keep their own patterns.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
+				"session_id": {
+					"type": "string",
+					"description": "Which open session's prompt regex to tune, as returned by start_session or list_sessions"
+				},
 				"regex": {
 					"type": "string",
 					"description": "Go (RE2) regular expression matching the shell prompt, e.g. (?m)^[^\\n]*[$#]\\s*$"
@@ -113,7 +128,7 @@ func tunePromptDefinition() mcp.Tool {
 					"default": false
 				}
 			},
-			"required": ["regex"]
+			"required": ["session_id", "regex"]
 		}`),
 		OutputSchema: json.RawMessage(`{
 			"type": "object",

@@ -17,15 +17,40 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// SSHConfig describes the single long-lived shell session this server drives.
+// SSHConfig describes the shell sessions this server drives. One session is one SSH
+// command, spawned on demand by start_session and run exactly once; several may be live at
+// a time, each independent of the others.
 type SSHConfig struct {
-	// Command is the shell command line that opens the session, run via `sh -c`.
-	// It is executed exactly once for the process lifetime.
+	// Command is the shell command line that opens a session, run via `sh -c`. It is a Go
+	// text/template rendered per session against the values start_session was called with;
+	// with no ssh.parameters declared it is simply a constant. Each rendered command is
+	// executed exactly once, for the life of the session it opened.
+	//
+	// SECURITY: this string reaches `sh -c` on the host running this server, so what a
+	// parameter is permitted to interpolate into it is the difference between choosing a
+	// target and choosing a command. See ParameterConfig.Pattern.
 	Command string `yaml:"command"`
 
 	// PromptRegex matches the remote shell's prompt. It frames the initial login and
-	// backstops recovery; per-command framing uses the sentinel when available.
+	// backstops recovery; per-command framing uses the sentinel when available. Also a
+	// template, so a prompt that embeds the target's own hostname or username can be
+	// matched exactly.
 	PromptRegex string `yaml:"prompt_regex"`
+
+	// Parameters declares the values start_session accepts and interpolates into Command
+	// and PromptRegex. Empty means the two templates are constants and start_session takes
+	// no arguments.
+	Parameters []ParameterConfig `yaml:"parameters"`
+
+	// MaxSessions caps how many live sessions may exist at once. Sessions that have died
+	// do not count, so a failing target cannot wedge the server by filling the cap.
+	MaxSessions int `yaml:"max_sessions"`
+
+	// IdleTimeout closes sessions that have gone this long without running a command.
+	// Zero (the default) never reaps: on a PAM/PSM bastion, tearing down a privileged
+	// session someone is still reasoning about is worse than keeping it, and a stdio
+	// server's sessions are already bounded by the life of its client.
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
 
 	LoginTimeout    time.Duration `yaml:"login_timeout"`
 	CommandTimeout  time.Duration `yaml:"command_timeout"`
@@ -73,6 +98,11 @@ type Config struct {
 	Lib     *libconfig.Config
 	SSH     SSHConfig
 	Logging LoggingConfig
+
+	// Renderer turns start_session's arguments into one session's command and prompt
+	// regex. Built by Load so a template that references an undeclared parameter is a
+	// startup failure rather than a first-call one.
+	Renderer *Renderer
 }
 
 type fileEnvelope struct {
@@ -90,6 +120,7 @@ const (
 	DefaultRows            = 24
 	DefaultMaxOutputBytes  = 1 << 20 // 1 MiB
 	DefaultTranscriptBytes = 256 << 10
+	DefaultMaxSessions     = 8
 )
 
 // DefaultInitCommands quiet the remote shell down before we start scraping it.
@@ -129,6 +160,9 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging}
 	if err := cfg.SSH.applyDefaults(); err != nil {
+		return nil, err
+	}
+	if cfg.Renderer, err = NewRenderer(cfg.SSH); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -180,8 +214,14 @@ func (c *SSHConfig) applyDefaults() error {
 	if c.PromptRegex == "" {
 		return fmt.Errorf("ssh.prompt_regex is required")
 	}
-	if _, err := regexp.Compile(c.PromptRegex); err != nil {
-		return fmt.Errorf("ssh.prompt_regex does not compile: %w", err)
+	// With no parameters the regex is its own final form, so compile it now and fail at
+	// startup as this server always has. Once it is a template, the concrete pattern
+	// differs per session and can only be compiled when start_session renders it — where
+	// a failure is a clean tool error rather than a dead server.
+	if len(c.Parameters) == 0 {
+		if _, err := regexp.Compile(c.PromptRegex); err != nil {
+			return fmt.Errorf("ssh.prompt_regex does not compile: %w", err)
+		}
 	}
 
 	if c.LoginTimeout <= 0 {
@@ -212,6 +252,12 @@ func (c *SSHConfig) applyDefaults() error {
 		c.TranscriptBytes = 0
 	} else if c.TranscriptBytes == 0 {
 		c.TranscriptBytes = DefaultTranscriptBytes
+	}
+	if c.MaxSessions <= 0 {
+		c.MaxSessions = DefaultMaxSessions
+	}
+	if c.IdleTimeout < 0 {
+		c.IdleTimeout = 0
 	}
 	return nil
 }

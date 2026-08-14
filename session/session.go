@@ -177,12 +177,31 @@ func New(cfg Config) (*Session, error) {
 // StateAwaitingPrompt so the regex can be corrected at runtime. Start returns an error
 // only when the command itself could not be spawned.
 func (s *Session) Start(ctx context.Context) error {
-	if err := s.spawn(); err != nil {
+	if err := s.Spawn(); err != nil {
 		return err
 	}
-	s.handshake(ctx)
+	s.Handshake(ctx)
 	return nil
 }
+
+// Spawn starts the command under a PTY and returns as soon as it is running, without
+// waiting for a prompt. It is the fast, reliably-failing half of Start: everything that can
+// go wrong here (a command that does not exist, no PTY available) does so in microseconds
+// and is worth reporting to whoever asked for the session.
+//
+// Callers that split the two must call Handshake afterwards; until they do, the session
+// sits in StateStarting and Execute refuses cleanly.
+func (s *Session) Spawn() error { return s.spawn() }
+
+// Handshake waits for the login prompt, probes sentinel support, and runs the init
+// commands, leaving the session in StateReady — or in StateAwaitingPrompt if the prompt
+// regex never matched, which is recoverable via SetPromptRegex and Resync.
+//
+// This is the slow half, and how slow is a property of the far end rather than of anything
+// this process controls: banners, MFA and PAM dispatch on a bastion routinely outlast an
+// MCP client's patience. It reports nothing because there is nothing a caller could do with
+// the answer that reading the session's state would not tell it better.
+func (s *Session) Handshake(ctx context.Context) { s.handshake(ctx) }
 
 func (s *Session) spawn() error {
 	proc := exec.Command("sh", "-c", s.cfg.Command)

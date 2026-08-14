@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -231,6 +232,115 @@ func TestLoadParsesLoggingFile(t *testing.T) {
 	// The library's own parse of the same block must not choke on the extra key.
 	if cfg.Lib.Logging.Level != "info" {
 		t.Errorf("logging.level = %q, want default info", cfg.Lib.Logging.Level)
+	}
+}
+
+func TestLoadAppliesSessionLimitDefaults(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SSH.MaxSessions != DefaultMaxSessions {
+		t.Errorf("max_sessions = %d, want %d", cfg.SSH.MaxSessions, DefaultMaxSessions)
+	}
+	// Reaping is opt-in: closing a privileged bastion login nobody asked to close is a
+	// worse failure than keeping an idle one, and a stdio server's sessions already die
+	// with its client.
+	if cfg.SSH.IdleTimeout != 0 {
+		t.Errorf("idle_timeout = %v, want 0 (no reaping)", cfg.SSH.IdleTimeout)
+	}
+}
+
+func TestLoadParsesParameters(t *testing.T) {
+	cfg, err := Load(write(t, `
+server:
+  mode: stdio
+ssh:
+  command: "ssh -tt {{.user}}@{{.host}}"
+  prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+  max_sessions: 3
+  idle_timeout: 45m
+  parameters:
+    - parameter: host
+      description: "Bastion hostname"
+    - parameter: user
+      description: "PSM-crafted username"
+      pattern: '^[a-z]+$'
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.SSH.MaxSessions != 3 {
+		t.Errorf("max_sessions = %d, want 3", cfg.SSH.MaxSessions)
+	}
+	if cfg.SSH.IdleTimeout != 45*time.Minute {
+		t.Errorf("idle_timeout = %v, want 45m", cfg.SSH.IdleTimeout)
+	}
+	if cfg.Renderer == nil {
+		t.Fatal("Load did not build a Renderer")
+	}
+
+	params := cfg.Renderer.Parameters()
+	if len(params) != 2 {
+		t.Fatalf("Parameters() returned %d entries, want 2", len(params))
+	}
+	if params[0].Parameter != "host" || params[0].Description != "Bastion hostname" {
+		t.Errorf("first parameter = %+v, want host/Bastion hostname", params[0])
+	}
+	if params[0].Pattern != DefaultParameterPattern {
+		t.Errorf("host pattern = %q, want the default", params[0].Pattern)
+	}
+	if params[1].Pattern != "^[a-z]+$" {
+		t.Errorf("user pattern = %q, want the explicit one", params[1].Pattern)
+	}
+
+	command, _, err := cfg.Renderer.Render(map[string]string{"host": "bastion.example.com", "user": "psm"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if want := "ssh -tt psm@bastion.example.com"; command != want {
+		t.Errorf("command = %q, want %q", command, want)
+	}
+}
+
+// A template typo must be a startup failure. The alternative is discovering it on the first
+// start_session against a bastion, which is exactly where this server can least afford a
+// surprise.
+func TestLoadRejectsATemplateReferencingAnUndeclaredParameter(t *testing.T) {
+	_, err := Load(write(t, `
+server:
+  mode: stdio
+ssh:
+  command: "ssh -tt {{.user}}@{{.host}}"
+  prompt_regex: 'x'
+  parameters:
+    - parameter: host
+      description: "Bastion hostname"
+`))
+	if err == nil {
+		t.Fatal("expected an error for {{.user}} with no user parameter")
+	}
+	if !strings.Contains(err.Error(), "user") {
+		t.Errorf("error does not name the undeclared parameter: %v", err)
+	}
+}
+
+// prompt_regex only has a final form once it is rendered, so its compile moves to
+// start_session as soon as it is a template — but a non-parametric config must still fail
+// at startup exactly as it always did (see TestLoadRejectsIncompleteConfig).
+func TestLoadDefersPromptRegexCompileWhenParametric(t *testing.T) {
+	if _, err := Load(write(t, `
+server:
+  mode: stdio
+ssh:
+  command: "ssh {{.host}}"
+  prompt_regex: '([unclosed{{.host}}'
+  parameters:
+    - parameter: host
+      description: "Bastion hostname"
+`)); err != nil {
+		t.Errorf("Load should not compile a templated prompt_regex at startup: %v", err)
 	}
 }
 
