@@ -1,0 +1,78 @@
+# mcp-linux-over-ssh configuration.
+#
+# This one file feeds two parsers: generic-go-mcp reads server: and logging:, and this
+# server reads ssh:.
+
+server:
+  # stdio is the only mode this server supports.
+  mode: stdio
+
+logging:
+  # trace | debug | info | warn | error. Logs go to stderr; stdout carries JSON-RPC.
+  level: info
+  # text | json
+  format: text
+
+ssh:
+  # The command that opens the session, run once via `sh -c` for the process lifetime.
+  # It is never re-run per tool call — that constraint is the reason this server exists.
+  # Use -tt to force a TTY: the shell only prints a prompt when it thinks it is
+  # interactive, and prompt detection is what frames the session.
+  command: "ssh -tt psmuser@bastion.example.com"
+
+  # Go (RE2) regex matching the remote shell's prompt. It frames login and backstops
+  # recovery. Getting this wrong is the most common failure: the session then starts in
+  # the awaiting_prompt state rather than dying, so read the
+  # mcp+stdio:///session/transcript resource and repair it with the tune_prompt_regex
+  # tool. Output is stripped of ANSI escapes and CRLF-normalised before matching, so
+  # write the pattern against the text a human would see.
+  prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+
+  # How long to wait for the first prompt after the command starts. Allow for banners,
+  # MFA, and whatever dispatching the bastion does.
+  login_timeout: 60s
+
+  # Per-command ceiling. On expiry the command is interrupted and the session is
+  # resynchronised so the next caller is not handed a stream mid-command.
+  command_timeout: 300s
+
+  # How long resynchronisation itself may take after an interrupt.
+  recovery_timeout: 15s
+
+  # TERM for the child. "dumb" keeps most shells from emitting colour and cursor motion.
+  # Raise to vt100/xterm only if the bastion misbehaves without it.
+  term: dumb
+
+  # PTY dimensions. A wide terminal keeps long command lines from hard-wrapping.
+  cols: 500
+  rows: 24
+
+  # Run once after login, before the session is declared ready. `stty -echo` is the clean
+  # fix for command echo; output framing tolerates echo either way.
+  init_commands:
+    - "stty -echo"
+    - "unset PROMPT_COMMAND"
+
+  # Wrap each command with an end marker carrying $?, giving exact framing and a real
+  # exit code. Support is probed at startup; a shell that cannot do it falls back to
+  # prompt-only framing automatically. Set false to skip the probe entirely.
+  use_sentinel: true
+
+  # Cap on returned output. The command is still consumed in full — only what is handed
+  # back is shortened, keeping the head and the tail.
+  max_output_bytes: 1048576
+
+  # Raw bytes retained for the transcript resource. Set to -1 to disable recording.
+  # WARNING: the transcript is verbatim terminal output and may contain secrets that were
+  # printed to the shell.
+  transcript_bytes: 262144
+
+  # Permit re-running `command` once if the session dies and cannot be resynchronised.
+  # Off by default: on a PAM/PSM bastion a reconnect is a new audited session, not a
+  # retry.
+  allow_reconnect: false
+
+  # Require the caller to confirm each command via an MRTR elicitation before it runs.
+  # With this on, clients that do not declare the elicitation capability cannot use
+  # run_bash at all.
+  require_confirmation: true
