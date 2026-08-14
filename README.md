@@ -69,6 +69,7 @@ Nothing is connected when the server starts.
 | `run_bash` | Runs a command on the session named by `session_id`. |
 | `tune_prompt_regex` | Repairs one session's prompt regex in place, without restarting. |
 | `end_session` | Closes a session and frees its slot. |
+| `is_disabled_by_flag` | Whether the operator has administratively disabled the server. Advertised **only** when `ssh.disable_flag_file` is configured — see below. |
 
 Each session is one shell running one command at a time, so working directory and
 exported variables persist across calls on the same id and are independent between ids.
@@ -83,6 +84,28 @@ looser. Declaring no parameters leaves the templates as constants.
 
 `ssh.max_sessions` caps concurrent sessions (default 8); `ssh.idle_timeout` optionally
 reaps idle ones and is off by default.
+
+### Administrative disable
+
+Set `ssh.disable_flag_file` to a path and it becomes a kill switch. While a file exists
+there, `start_session` and `run_bash` refuse with an error saying the server is *disabled
+by flag file and requires user intervention to proceed*, and sessions that are already
+open are terminated as soon as they are not mid-command — a command in flight finishes,
+but nothing can follow it. Removing the file resumes normal service with no restart.
+
+Only the file's existence matters, so `touch` and `rm` are the whole interface:
+
+```
+touch /var/run/mcp-linux-over-ssh.disabled   # stop
+rm    /var/run/mcp-linux-over-ssh.disabled   # resume
+```
+
+`list_sessions` keeps working throughout and reports the block, which is where a client
+finds out *why* its sessions went away. So does `is_disabled_by_flag`, a no-argument tool
+returning `{"disabled": true|false}` — and that tool is advertised **only** when a flag
+file is configured, so its presence in `tools/list` is itself the answer to whether this
+server can be stopped this way. Omit the key and neither the tool nor any of the rest of
+this exists.
 
 See `config.yaml.example` for the full set of options, and each session's
 `mcp+stdio:///session/<id>/transcript` resource plus the `tune_prompt_regex` tool for

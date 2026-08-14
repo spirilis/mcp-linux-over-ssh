@@ -20,6 +20,17 @@ const (
 	sessionURIPrefix = "mcp+stdio:///session/"
 )
 
+// disabledToolNote is appended to the description of every tool an administrative flag file
+// can refuse, and only when the operator has actually configured one.
+//
+// It exists because of who reads these descriptions. A model that meets an unexplained
+// refusal reasons its way around it — retry, try a different argument, try the other tool —
+// and every one of those attempts fails identically while looking, from the outside, like a
+// server misbehaving. Naming the mechanism up front converts that into the one correct
+// response: stop, and tell the human.
+const disabledToolNote = "This server can be administratively disabled by its operator. " +
+	"While it is, this tool returns an error saying so and no amount of retrying will change that — call is_disabled_by_flag to confirm that is the cause, then report it to the user and stop."
+
 // StatusURI is where a single session's state is published.
 func StatusURI(id string) string { return sessionURIPrefix + id + "/status" }
 

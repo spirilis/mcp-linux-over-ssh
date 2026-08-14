@@ -54,8 +54,8 @@ func endSessionDefinition() mcp.Tool {
 	destructive := true
 	return mcp.Tool{
 		Name:  "end_session",
-		Title: "Close SSH Session",
-		Description: "Closes an SSH session opened with start_session, terminating its shell and freeing its slot. " +
+		Title: "Close Session",
+		Description: "Closes a session opened with start_session, terminating its shell and freeing its slot. " +
 			"Call this as soon as you are done with a session: each one is a real privileged login held open on the remote side, and only a limited number may exist at once. " +
 			"Any command still running on that session is cancelled. The id becomes invalid immediately and the session cannot be reopened — start_session gives you a new one.",
 		InputSchema: json.RawMessage(`{
@@ -79,7 +79,7 @@ func endSessionDefinition() mcp.Tool {
 			"required": ["session_id", "ended", "remaining"]
 		}`),
 		Annotations: &mcp.ToolAnnotations{
-			Title:           "Close SSH Session",
+			Title:           "Close Session",
 			DestructiveHint: &destructive,
 			IdempotentHint:  true,
 		},

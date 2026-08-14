@@ -3,6 +3,8 @@ package session
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -369,4 +371,122 @@ func TestManagerCloseAllEndsEverything(t *testing.T) {
 	// complete" line — so a second pass must be a no-op rather than a panic on a closed
 	// channel.
 	m.CloseAll()
+}
+
+// newFlagFile returns a gate over a path in a fresh temp directory, plus functions to raise
+// and clear the flag. Deliberately the real FlagFileGate over a real file rather than a
+// stub: the interesting behaviour is the whole loop from a file appearing to a shell dying,
+// and a stub would only prove the manager talks to whatever it is handed.
+func newFlagFile(t *testing.T) (gate *FlagFileGate, raise, clear func()) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "disabled")
+	return NewFlagFileGate(path),
+		func() {
+			t.Helper()
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatalf("raising the flag: %v", err)
+			}
+		},
+		func() {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("clearing the flag: %v", err)
+			}
+		}
+}
+
+// The refusal has to reach the caller before anything is spawned. This needs no shell, since
+// the gate is consulted ahead of session.New.
+func TestManagerGateRefusesNewSessions(t *testing.T) {
+	m := NewManager(4, 0)
+	t.Cleanup(m.CloseAll)
+
+	gate, raise, _ := newFlagFile(t)
+	m.SetGate(gate, 0) // no poll loop: this is only about admission
+	raise()
+
+	_, err := m.Start(testConfig(), nil)
+	if err == nil {
+		t.Fatal("Start succeeded while the disable flag was raised")
+	}
+	if !errors.Is(err, ErrDisabled) {
+		t.Errorf("error = %v, want it to wrap ErrDisabled", err)
+	}
+	if m.Len() != 0 {
+		t.Errorf("Len() = %d after a refused Start, want 0 — something was spawned anyway", m.Len())
+	}
+}
+
+// The gate outranks the cap. Both refuse, but only one of them is true, and telling a caller
+// to end sessions it cannot end — because they are already being torn down — sends it round
+// a loop that cannot terminate.
+func TestManagerGateOutranksTheSessionCap(t *testing.T) {
+	m := NewManager(1, 0)
+	t.Cleanup(m.CloseAll)
+
+	gate, raise, _ := newFlagFile(t)
+	m.SetGate(gate, 0)
+	raise()
+
+	_, err := m.Start(testConfig(), nil)
+	if errors.Is(err, ErrSessionLimit) {
+		t.Errorf("error = %v, want the administrative reason rather than the cap", err)
+	}
+	if !errors.Is(err, ErrDisabled) {
+		t.Errorf("error = %v, want it to wrap ErrDisabled", err)
+	}
+}
+
+// The core of the feature: a flag raised mid-flight ages open sessions out, but never at the
+// cost of a command already running. The busy session goes when its command finishes and not
+// before, which is what makes this a controlled stop rather than a kill.
+func TestManagerGateTerminatesIdleSessionsAndWaitsForBusyOnes(t *testing.T) {
+	m := newTestManager(t, 4, 0)
+
+	gate, raise, clear := newFlagFile(t)
+	m.SetGate(gate, 100*time.Millisecond)
+
+	idle := startReady(t, m, nil)
+	busy := startReady(t, m, nil)
+
+	busySess, _ := m.Get(busy)
+	commandDone := make(chan struct{})
+	go func() {
+		defer close(commandDone)
+		_, _ = busySess.Execute(context.Background(), "sleep 4")
+	}()
+	waitForState(t, m, busy, StateBusy)
+
+	raise()
+
+	// Polled through List, not Get: Get stamps a session as used, and the point here is what
+	// happens to sessions nobody is touching.
+	waitUntilGone(t, m, idle, 10*time.Second, "the idle session was never terminated after the flag was raised")
+
+	// ...and the busy one is still there, because its command is still running. Asserted
+	// after the idle one is already gone, so the poll loop has demonstrably run.
+	if !listed(m, busy) {
+		t.Fatal("a session running a command was terminated instead of being left to finish")
+	}
+
+	<-commandDone
+	waitUntilGone(t, m, busy, 10*time.Second, "the busy session was never terminated after its command finished")
+
+	// And the far side of the switch: removing the file restores service with no restart.
+	clear()
+	if _, err := m.Start(testConfig(), nil); err != nil {
+		t.Errorf("Start after clearing the flag: %v", err)
+	}
+}
+
+// waitUntilGone polls List until id is no longer registered.
+func waitUntilGone(t *testing.T, m *Manager, id string, within time.Duration, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for listed(m, id) {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

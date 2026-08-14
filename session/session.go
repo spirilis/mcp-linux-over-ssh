@@ -70,7 +70,7 @@ func (s State) String() string {
 var (
 	ErrTimeout        = errors.New("timed out waiting for the shell")
 	ErrNotReady       = errors.New("session is not ready")
-	ErrDead           = errors.New("session is dead; the SSH command cannot be re-run, restart the server")
+	ErrDead           = errors.New("session is dead; the command that opened it cannot be re-run, so start a new session")
 	ErrAwaitingPrompt = errors.New("the configured prompt regex has not matched the shell's output; read the session transcript and correct it with tune_prompt_regex")
 	ErrDesynced       = errors.New("the shell could not be resynchronised after an abandoned command")
 )

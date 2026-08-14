@@ -22,10 +22,24 @@ import (
 func NewListSessions(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
 	return listSessionsDefinition(), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		infos := mgr.List()
+		// Deliberately not refused when the server is disabled — looking is always allowed.
+		// This is where a model comes to work out why its sessions evaporated, and answering
+		// "you may not look" would leave it with the disappearance and no cause.
+		blocked := mgr.Blocked()
+
+		structured := map[string]any{
+			"sessions":     sessionSummaries(infos),
+			"count":        len(infos),
+			"max_sessions": mgr.Max(),
+			"disabled":     blocked != nil,
+		}
+		if blocked != nil {
+			structured["disabled_reason"] = blocked.Error()
+		}
 
 		return &mcp.ToolCallResult{
-			Content:           []mcp.Content{mcp.Text(renderSessions(infos, mgr.Max()))},
-			StructuredContent: map[string]any{"sessions": sessionSummaries(infos), "count": len(infos), "max_sessions": mgr.Max()},
+			Content:           []mcp.Content{mcp.Text(renderSessions(infos, mgr.Max(), blocked))},
+			StructuredContent: structured,
 		}, nil
 	}
 }
@@ -55,12 +69,26 @@ func sessionSummaries(infos []session.Info) []map[string]any {
 	return out
 }
 
-func renderSessions(infos []session.Info, max int) string {
+func renderSessions(infos []session.Info, max int, blocked error) string {
+	var b strings.Builder
+	if blocked != nil {
+		// First line, before the listing. Whatever the listing says is a consequence of
+		// this, including an empty one, and a reader who meets the cause first does not have
+		// to reconstruct it from the effect.
+		fmt.Fprintf(&b, "THIS SERVER IS ADMINISTRATIVELY DISABLED: %v\n", blocked)
+		b.WriteString("No session can be started and no command can be run until a person clears it. ")
+		b.WriteString("Any session listed below is being terminated as soon as it stops running whatever it is running. ")
+		b.WriteString("Report this to the user rather than retrying.\n\n")
+	}
+
 	if len(infos) == 0 {
+		if blocked != nil {
+			b.WriteString("No sessions are open.")
+			return b.String()
+		}
 		return "No sessions are open. Call start_session to open one."
 	}
 
-	var b strings.Builder
 	fmt.Fprintf(&b, "%d session(s) open, of a maximum %d:\n\n", len(infos), max)
 	for _, in := range infos {
 		fmt.Fprintf(&b, "%s  [%s]\n", in.ID, in.Status.State)
@@ -105,10 +133,11 @@ func formatParameters(params map[string]string) string {
 func listSessionsDefinition() mcp.Tool {
 	return mcp.Tool{
 		Name:  "list_sessions",
-		Title: "List SSH Sessions",
-		Description: "Lists every SSH session currently open on this server, with its id, state, the command that opened it, and the parameters it was opened with. " +
+		Title: "List Sessions",
+		Description: "Lists every session currently open on this server, with its id, state, the command that opened it, and the parameters it was opened with. " +
 			"Use it to find the id of a session you have lost track of, and to check whether a session started with start_session has finished logging in — state \"ready\" means it can run commands. " +
-			"An empty list means nothing is connected and you need start_session first.",
+			"An empty list means nothing is connected and you need start_session first. " +
+			"It also reports whether the operator has administratively disabled this server, which is the explanation to check first if sessions have stopped working or have disappeared.",
 		InputSchema: json.RawMessage(`{"type": "object", "properties": {}, "additionalProperties": false}`),
 		OutputSchema: json.RawMessage(`{
 			"type": "object",
@@ -133,12 +162,14 @@ func listSessionsDefinition() mcp.Tool {
 					}
 				},
 				"count": {"type": "integer"},
-				"max_sessions": {"type": "integer", "description": "How many sessions may be open at once"}
+				"max_sessions": {"type": "integer", "description": "How many sessions may be open at once"},
+				"disabled": {"type": "boolean", "description": "True when the operator has administratively disabled this server; no session can be started or used until that is cleared"},
+				"disabled_reason": {"type": "string", "description": "Why the server is disabled; present only when disabled is true"}
 			},
-			"required": ["sessions", "count", "max_sessions"]
+			"required": ["sessions", "count", "max_sessions", "disabled"]
 		}`),
 		Annotations: &mcp.ToolAnnotations{
-			Title:          "List SSH Sessions",
+			Title:          "List Sessions",
 			ReadOnlyHint:   true,
 			IdempotentHint: true,
 		},

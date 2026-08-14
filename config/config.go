@@ -52,6 +52,22 @@ type SSHConfig struct {
 	// server's sessions are already bounded by the life of its client.
 	IdleTimeout time.Duration `yaml:"idle_timeout"`
 
+	// DisableFlagFile is an administrative kill switch: while a file exists at this path,
+	// start_session and run_bash refuse with an error saying so, and sessions already open
+	// are terminated as soon as they are not mid-command. Removing the file restores normal
+	// service with no restart. Empty (the default) means no such check exists at all.
+	//
+	// Only the file's existence matters; its contents are never read. A relative path is
+	// resolved against the working directory at startup — see session.NewFlagFileGate for
+	// why that is done once rather than per check.
+	DisableFlagFile string `yaml:"disable_flag_file"`
+
+	// DisableFlagPollInterval is how often the flag file is re-checked for the purpose of
+	// terminating sessions that are already open. It does not delay the refusal of new work:
+	// start_session and run_bash stat the file themselves, so they can never act on a stale
+	// answer. This bounds only how long an open, quiet session outlives the flag appearing.
+	DisableFlagPollInterval time.Duration `yaml:"disable_flag_poll_interval"`
+
 	LoginTimeout    time.Duration `yaml:"login_timeout"`
 	CommandTimeout  time.Duration `yaml:"command_timeout"`
 	RecoveryTimeout time.Duration `yaml:"recovery_timeout"`
@@ -121,6 +137,12 @@ const (
 	DefaultMaxOutputBytes  = 1 << 20 // 1 MiB
 	DefaultTranscriptBytes = 256 << 10
 	DefaultMaxSessions     = 8
+
+	// DefaultDisableFlagPollInterval is how quickly an open, quiet session notices the
+	// disable flag file appearing. Only meaningful when ssh.disable_flag_file is set. Five
+	// seconds is a stat every five seconds against a promptness an operator reaching for a
+	// kill switch will accept; the refusal of *new* work is immediate regardless.
+	DefaultDisableFlagPollInterval = 5 * time.Second
 )
 
 // DefaultInitCommands quiet the remote shell down before we start scraping it.
@@ -258,6 +280,9 @@ func (c *SSHConfig) applyDefaults() error {
 	}
 	if c.IdleTimeout < 0 {
 		c.IdleTimeout = 0
+	}
+	if c.DisableFlagPollInterval <= 0 {
+		c.DisableFlagPollInterval = DefaultDisableFlagPollInterval
 	}
 	return nil
 }

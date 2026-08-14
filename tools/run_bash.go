@@ -1,4 +1,4 @@
-// Package tools implements the MCP tools this server exposes over its single shell.
+// Package tools implements the MCP tools this server exposes over its sessions.
 package tools
 
 import (
@@ -39,7 +39,17 @@ var confirmSchema = json.RawMessage(`{
 // command. Clients that have not declared the elicitation capability cannot use the tool at
 // all in that mode.
 func NewRunBash(mgr *session.Manager, requireConfirmation bool) (mcp.Tool, mcp.ToolFunction) {
-	return runBashDefinition(requireConfirmation), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
+	return runBashDefinition(requireConfirmation, mgr.Gated()), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
+		// Ahead of everything, including the confirmation round trip: there is no point
+		// asking a user to approve a command the server has already been told not to run,
+		// and re-checking here means a flag raised *during* that round trip still stops the
+		// replay. A session left open only because it was mid-command when the flag went up
+		// is likewise unreachable from here, which is what lets the manager's poll loop
+		// close it the moment it goes quiet.
+		if err := mgr.Blocked(); err != nil {
+			return mcp.ErrorResultf("cannot run a command: %v", err), nil
+		}
+
 		var args RunBashArguments
 		if err := req.BindArguments(&args); err != nil {
 			return mcp.ErrorResultf("invalid arguments: %v", err), nil
@@ -127,22 +137,25 @@ func structuredResult(res *session.Result) map[string]any {
 	return out
 }
 
-func runBashDefinition(requireConfirmation bool) mcp.Tool {
-	desc := "Executes a shell command on the remote host of an open SSH session and returns its output and exit code. " +
+func runBashDefinition(requireConfirmation, gated bool) mcp.Tool {
+	desc := "Executes a shell command on the remote host of an open session and returns its output and exit code. " +
 		"Requires a session_id from start_session; call list_sessions if you do not have one, and check that the session's state is \"ready\" first. " +
 		"WARNING: Do NOT use this tool for destructive commands or operations that may overwrite files without explicit user consent. " +
 		"Each session is one shell running commands one at a time, so state such as the working directory and exported variables persists between calls on the same session_id — and is entirely separate between different session_ids. " +
 		"Do not run interactive or full-screen programs (vim, top, less, or anything that reads stdin) — they will hang until the command timeout and force a session resynchronisation. " +
-		"Never run anything that terminates the shell itself (exit, logout, kill on its own PID): that shell IS the session, its SSH command cannot be re-run, and ending it kills the session for good — use end_session to close one deliberately. " +
+		"Never run anything that terminates the shell itself (exit, logout, kill on its own PID): that shell IS the session, the command that opened it cannot be re-run, and ending it kills the session for good — use end_session to close one deliberately. " +
 		"To get a non-zero status without leaving the shell, use a subshell such as (exit 3)."
 	if requireConfirmation {
 		desc += " Every call requires the user to explicitly confirm the exact command before it runs — the tool will pause and ask."
+	}
+	if gated {
+		desc += " " + disabledToolNote + " Sessions already open are terminated once whatever they were running finishes."
 	}
 
 	destructive, openWorld := true, true
 	return mcp.Tool{
 		Name:        "run_bash",
-		Title:       "Run Command Over SSH",
+		Title:       "Run Remote Command",
 		Description: desc,
 		InputSchema: json.RawMessage(`{
 			"type": "object",
@@ -169,7 +182,7 @@ func runBashDefinition(requireConfirmation bool) mcp.Tool {
 			"required": ["output", "truncated", "duration_ms"]
 		}`),
 		Annotations: &mcp.ToolAnnotations{
-			Title:           "Run Command Over SSH",
+			Title:           "Run Remote Command",
 			DestructiveHint: &destructive,
 			OpenWorldHint:   &openWorld,
 		},

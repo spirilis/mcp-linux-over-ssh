@@ -25,7 +25,16 @@ import (
 func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Config) (mcp.Tool, mcp.ToolFunction) {
 	params := r.Parameters()
 
-	return startSessionDefinition(params, mgr.Max()), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
+	return startSessionDefinition(params, mgr.Max(), mgr.Gated()), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
+		// First, before the arguments are even looked at. An administrative stop is a fact
+		// about the server rather than about this request, so it is the honest answer no
+		// matter what was asked for, and rendering a command line for a session that cannot
+		// open is wasted work. Manager.Start checks again and is the actual enforcement
+		// point; this is here for the message, which needs to tell a model to stop.
+		if err := mgr.Blocked(); err != nil {
+			return mcp.ErrorResultf("cannot start a session: %v", err), nil
+		}
+
 		values, err := bindParameterValues(req.Arguments)
 		if err != nil {
 			return mcp.ErrorResultf("invalid arguments: %v", err), nil
@@ -57,7 +66,7 @@ func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Conf
 		fmt.Fprintf(&b, "Session %s is opening.\n\n", id)
 		fmt.Fprintf(&b, "Command: %s\n", command)
 		fmt.Fprintf(&b, "State:   %s\n\n", state)
-		b.WriteString("The SSH login is still in progress; it can take a while on a bastion that shows banners or asks for MFA. ")
+		b.WriteString("The login is still in progress; it can take a while on a target that shows banners or asks for MFA. ")
 		b.WriteString("Wait for the state to reach \"ready\" — call list_sessions, or read ")
 		b.WriteString(StatusURI(id))
 		b.WriteString(" — before running a command. A run_bash sent too early fails harmlessly with \"session is not ready\", so retrying is safe.\n")
@@ -79,8 +88,8 @@ func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Conf
 	}
 }
 
-func startSessionDefinition(params []config.ParameterConfig, max int) mcp.Tool {
-	desc := "Opens a new SSH shell session on a remote host and returns the session id that every other tool in this server takes. " +
+func startSessionDefinition(params []config.ParameterConfig, max int, gated bool) mcp.Tool {
+	desc := "Opens a new shell session on a remote host and returns the session id that every other tool in this server takes. " +
 		"Nothing is connected until you call this. " +
 		"The session is a real login that stays open until you end it, so shell state (working directory, exported variables) persists across run_bash calls on the same id, " +
 		"and several independent sessions can be open at once. " +
@@ -89,16 +98,19 @@ func startSessionDefinition(params []config.ParameterConfig, max int) mcp.Tool {
 	if len(params) > 0 {
 		desc += " Each argument selects which host this session connects to; they are validated against patterns the operator configured, and a rejected value is a configuration boundary rather than something to work around."
 	}
+	if gated {
+		desc += " " + disabledToolNote
+	}
 
 	openWorld := true
 	return mcp.Tool{
 		Name:         "start_session",
-		Title:        "Open SSH Session",
+		Title:        "Open Session",
 		Description:  desc,
 		InputSchema:  startSessionSchema(params),
 		OutputSchema: startSessionOutputSchema(),
 		Annotations: &mcp.ToolAnnotations{
-			Title:         "Open SSH Session",
+			Title:         "Open Session",
 			OpenWorldHint: &openWorld,
 		},
 	}

@@ -98,6 +98,30 @@ ssh:
   # Like every duration here it must be written as a string with a unit — 30m, not 30.
   # idle_timeout: 30m
 
+  # Administrative kill switch. While a file exists at this path, start_session and
+  # run_bash refuse with an error saying the server is "disabled by flag file and requires
+  # user intervention to proceed", and sessions that are already open are terminated as
+  # soon as they are not mid-command — a command in flight is allowed to finish, but
+  # nothing can follow it. Removing the file restores normal service with no restart.
+  #
+  # Only the file's existence matters; its contents are never read, so `touch` and `rm`
+  # (or a config-management resource, or a systemd unit's ExecStartPre) are the whole
+  # interface. Omitted, which is the default, there is no such check at all.
+  #
+  # Use an absolute path. A relative one is resolved against the working directory at
+  # startup, and an MCP client chooses that, not you.
+  #
+  # NOTE: a path this server cannot stat for any reason other than "does not exist" — an
+  # unreadable parent directory, a wedged mount — counts as disabled. The control fails
+  # closed on purpose: a check that cannot be performed is not permission to keep running.
+  # disable_flag_file: /var/run/mcp-linux-over-ssh.disabled
+
+  # How often the flag file is re-checked for the purpose of terminating sessions that are
+  # already open. This does NOT delay the refusal of new work: start_session and run_bash
+  # stat the file themselves on every call, so a raised flag stops the very next one. This
+  # bounds only how long an open, quiet session outlives the flag appearing. Default 5s.
+  # disable_flag_poll_interval: 5s
+
   # How long to wait for the first prompt after the command starts. Allow for banners,
   # MFA, and whatever dispatching the bastion does.
   login_timeout: 60s

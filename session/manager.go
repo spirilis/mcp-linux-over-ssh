@@ -37,11 +37,22 @@ type Manager struct {
 	max         int
 	idleTimeout time.Duration
 
+	// gate, when set, can administratively refuse all session activity. See SetGate.
+	gate Gate
+
 	onAdd    func(id string, s *Session)
 	onRemove func(id string)
 
 	stopOnce sync.Once
 	stop     chan struct{}
+}
+
+// ref is one session lifted out from under the manager's lock, so the state and lifecycle
+// calls that follow — both of which take locks of their own — happen outside it.
+type ref struct {
+	id       string
+	sess     *Session
+	lastUsed time.Time
 }
 
 type entry struct {
@@ -93,6 +104,51 @@ func (m *Manager) SetLifecycleObserver(onAdd func(id string, s *Session), onRemo
 	m.mu.Unlock()
 }
 
+// SetGate installs an administrative gate and, when poll is positive, starts the goroutine
+// that enforces it against sessions that are already open. Call it once, before serving; a
+// nil gate leaves the manager ungated, which is the default.
+//
+// Enforcement has two halves because a gate has to reach two different things. Start
+// consults it directly, so a block takes hold on the very next call with no window at all.
+// The poll loop exists for the sessions nobody is calling about: an open, idle shell holding
+// a privileged login would otherwise sit there until someone happened to use it.
+func (m *Manager) SetGate(g Gate, poll time.Duration) {
+	m.mu.Lock()
+	m.gate = g
+	m.mu.Unlock()
+
+	if g != nil && poll > 0 {
+		go m.enforceGate(poll)
+	}
+}
+
+// Blocked reports why session activity is currently refused, or nil when it is permitted.
+// An ungated manager always permits.
+//
+// The gate is called outside the manager's lock: FlagFileGate stats a file, and holding a
+// lock every tool call needs across a filesystem operation is how a slow mount turns a
+// refusal into a hang.
+func (m *Manager) Blocked() error {
+	m.mu.Lock()
+	g := m.gate
+	m.mu.Unlock()
+
+	if g == nil {
+		return nil
+	}
+	return g.Blocked()
+}
+
+// Gated reports whether a gate is installed at all — not whether it is currently blocking.
+// Tool descriptions use it to tell the model that an administrative refusal is a thing this
+// server can legitimately do, which is what stops one from being read as a bug to route
+// around.
+func (m *Manager) Gated() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gate != nil
+}
+
 // Start creates a session from an already-rendered config, spawns its shell, and returns
 // the id under which it is now reachable. The login handshake runs in the background.
 //
@@ -105,6 +161,15 @@ func (m *Manager) SetLifecycleObserver(onAdd func(id string, s *Session), onRemo
 // audited, with nobody holding its id. Callers learn readiness from list_sessions or the
 // session's status resource; a command sent too early fails cleanly through checkRunnable.
 func (m *Manager) Start(cfg Config, params map[string]string) (string, error) {
+	// The gate outranks the cap: "an operator has stopped this server" is both the more
+	// accurate explanation and the more actionable one, and reporting a limit instead would
+	// send the caller off to end sessions that are already being torn down. Checked live
+	// rather than read from the poll loop's last observation, so a flag raised a millisecond
+	// ago still stops the very next session.
+	if err := m.Blocked(); err != nil {
+		return "", err
+	}
+
 	// New and Spawn run under the lock so the cap is enforced by construction. Two
 	// concurrent start_session calls are entirely possible — the transport dispatches
 	// every message in its own goroutine — and a check-then-act cap would let both
@@ -322,27 +387,31 @@ func (m *Manager) reap() {
 	}
 }
 
+// refs snapshots every registered session in creation order, under the lock.
+func (m *Manager) refs() []ref {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]ref, 0, len(m.order))
+	for _, id := range m.order {
+		if e, ok := m.sessions[id]; ok {
+			out = append(out, ref{id: e.id, sess: e.sess, lastUsed: e.lastUsed})
+		}
+	}
+	return out
+}
+
 // idleCandidates collects the ids eligible for reaping. The manager's own state is read
 // under its lock and everything else happens outside it, since both Session.Status and End
 // take locks of their own.
 func (m *Manager) idleCandidates() []string {
 	cutoff := time.Now().Add(-m.idleTimeout)
 
-	type candidate struct {
-		id   string
-		sess *Session
-	}
-	m.mu.Lock()
-	stale := make([]candidate, 0, len(m.sessions))
-	for _, e := range m.sessions {
-		if e.lastUsed.Before(cutoff) {
-			stale = append(stale, candidate{e.id, e.sess})
+	ids := make([]string, 0)
+	for _, r := range m.refs() {
+		if !r.lastUsed.Before(cutoff) {
+			continue
 		}
-	}
-	m.mu.Unlock()
-
-	ids := make([]string, 0, len(stale))
-	for _, c := range stale {
 		// Two states are busy in the sense that matters here, and neither shows up in
 		// lastUsed. Get stamps that clock when a session is handed to a command, not when
 		// the command finishes, so anything long-running looks perfectly idle by it; and a
@@ -350,11 +419,73 @@ func (m *Manager) idleCandidates() []string {
 		// with banners and MFA can easily outlast a short idle timeout. Reaping either one
 		// would destroy work in progress. Both are bounded — by command_timeout and
 		// login_timeout — so neither can defer reaping indefinitely.
-		switch c.sess.Status().State {
+		switch r.sess.Status().State {
 		case StateBusy.String(), StateStarting.String():
 			continue
 		}
-		ids = append(ids, c.id)
+		ids = append(ids, r.id)
+	}
+	return ids
+}
+
+// enforceGate polls the gate and, while it is blocking, ages every session out.
+//
+// It runs for the life of the manager rather than only while blocked, because the gate is
+// two-way: the same loop is what notices the flag going away and says so. Nothing else is
+// needed to re-enable the server, since Start consults the gate directly.
+func (m *Manager) enforceGate(poll time.Duration) {
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+
+	// Edge-triggered logging. Polling every few seconds forever would otherwise fill an
+	// operator's log with the same line, and the two transitions are the events worth having
+	// a timestamp for.
+	blocked := false
+
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			err := m.Blocked()
+			switch {
+			case err != nil && !blocked:
+				blocked = true
+				logging.Warn("session activity disabled; open sessions will be terminated as they go idle", "reason", err.Error())
+			case err == nil && blocked:
+				blocked = false
+				logging.Info("session activity re-enabled; new sessions may be started again")
+			}
+			if err == nil {
+				continue
+			}
+			for _, id := range m.gateCandidates() {
+				logging.Warn("terminating session because session activity is disabled", "session_id", id)
+				m.End(id)
+			}
+		}
+	}
+}
+
+// gateCandidates lists the sessions the gate may close on this tick: everything that is not
+// mid-command.
+//
+// A busy session is left alone and picked up on a later tick, which is the whole of
+// "terminated once any in-flight command completes" — there is no need to wait on anything,
+// because the command cannot be followed by another one. run_bash consults the gate before
+// it executes, so once a session goes quiet under a raised flag it stays quiet.
+//
+// Unlike the idle reaper this does not spare StateStarting. A session still logging in is
+// not doing work anyone asked to protect; it is a privileged login being negotiated against
+// a target the operator has just said to stop touching, and letting it complete would leave
+// the very thing the flag exists to prevent.
+func (m *Manager) gateCandidates() []string {
+	ids := make([]string, 0)
+	for _, r := range m.refs() {
+		if r.sess.Status().State == StateBusy.String() {
+			continue
+		}
+		ids = append(ids, r.id)
 	}
 	return ids
 }

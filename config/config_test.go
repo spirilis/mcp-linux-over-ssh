@@ -251,6 +251,44 @@ func TestLoadAppliesSessionLimitDefaults(t *testing.T) {
 	}
 }
 
+// The administrative disable flag is entirely opt-in. An empty path means no gate is built
+// at all, which is what keeps a config that has never heard of the feature from acquiring a
+// stat on every tool call — and, more to the point, from acquiring a kill switch at a path
+// nobody chose.
+func TestLoadLeavesTheDisableFlagFileUnsetByDefault(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SSH.DisableFlagFile != "" {
+		t.Errorf("disable_flag_file = %q, want empty", cfg.SSH.DisableFlagFile)
+	}
+	// The interval is defaulted regardless, so main.go never has to reason about a zero
+	// ticker interval when the flag file is set but the interval is not.
+	if cfg.SSH.DisableFlagPollInterval != DefaultDisableFlagPollInterval {
+		t.Errorf("disable_flag_poll_interval = %v, want %v", cfg.SSH.DisableFlagPollInterval, DefaultDisableFlagPollInterval)
+	}
+}
+
+func TestLoadParsesTheDisableFlagFile(t *testing.T) {
+	cfg, err := Load(write(t, `
+ssh:
+  command: "ssh -tt psm@bastion"
+  prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+  disable_flag_file: /var/run/mcp-linux-over-ssh.disabled
+  disable_flag_poll_interval: 2s
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SSH.DisableFlagFile != "/var/run/mcp-linux-over-ssh.disabled" {
+		t.Errorf("disable_flag_file = %q", cfg.SSH.DisableFlagFile)
+	}
+	if cfg.SSH.DisableFlagPollInterval != 2*time.Second {
+		t.Errorf("disable_flag_poll_interval = %v, want 2s", cfg.SSH.DisableFlagPollInterval)
+	}
+}
+
 func TestLoadParsesParameters(t *testing.T) {
 	cfg, err := Load(write(t, `
 server:

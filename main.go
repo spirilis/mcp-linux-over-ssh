@@ -32,7 +32,7 @@ import (
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.2.1"
+	serverVersion = "0.3.0"
 
 	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
 	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
@@ -123,6 +123,23 @@ func main() {
 	mgr := session.NewManager(cfg.SSH.MaxSessions, cfg.SSH.IdleTimeout)
 	defer mgr.CloseAll()
 
+	// Armed before the tools are built, because their descriptions depend on whether a gate
+	// exists at all: a model that is told an administrative refusal is possible reports one
+	// to the user, and a model that is not told routes around it.
+	if cfg.SSH.DisableFlagFile != "" {
+		gate := session.NewFlagFileGate(cfg.SSH.DisableFlagFile)
+		mgr.SetGate(gate, cfg.SSH.DisableFlagPollInterval)
+		logging.Info("administrative disable flag file armed",
+			"path", gate.Path(), "poll_interval", cfg.SSH.DisableFlagPollInterval)
+		if err := gate.Blocked(); err != nil {
+			// Not fatal: the server comes up serving tools/list and answering every call
+			// with the reason, which is a far better failure for whoever set the flag — and
+			// for the client that just launched this process — than a binary that exits and
+			// looks broken. Removing the file re-enables it with no restart.
+			logging.Warn("starting with session activity already disabled", "reason", err.Error())
+		}
+	}
+
 	resourceRegistry := mcp.NewResourceRegistry()
 	registerSessionsIndex(resourceRegistry, mgr)
 
@@ -132,12 +149,19 @@ func main() {
 	registry.Register(tools.NewEndSession(mgr))
 	registry.Register(tools.NewRunBash(mgr, requireConfirmation))
 	registry.Register(tools.NewTunePromptRegex(mgr))
+	if mgr.Gated() {
+		// Registered only when a gate exists, so the tool's presence in tools/list is itself
+		// the answer to whether this server can be disabled at all. A permanently-false
+		// check on every deployment would teach a caller to skip it on the ones where it
+		// means something.
+		registry.Register(tools.NewIsDisabledByFlag(mgr))
+	}
 
 	listTTL := int64(listTTLMs)
 	serverCfg := &mcp.ServerConfig{
 		Name:         serverName,
 		Version:      serverVersion,
-		Instructions: instructions(requireConfirmation, cfg.Renderer.Parametric()),
+		Instructions: instructions(requireConfirmation, cfg.Renderer.Parametric(), mgr.Gated()),
 		ListTTLMs:    &listTTL,
 	}
 	if compatEnabled {
@@ -357,8 +381,8 @@ func watchStdin() <-chan struct{} {
 func registerSessionsIndex(reg *mcp.ResourceRegistry, mgr *session.Manager) {
 	reg.Register(mcp.Resource{
 		URI:  tools.SessionsURI,
-		Name: "Open SSH Sessions",
-		Description: "Every SSH session currently open on this server: its id, the command that opened it, the parameters it was opened with, and its live state. " +
+		Name: "Open Sessions",
+		Description: "Every session currently open on this server: its id, the command that opened it, the parameters it was opened with, and its live state. " +
 			"The same information the list_sessions tool returns.",
 		MimeType: "application/json",
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
@@ -376,7 +400,7 @@ func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *sessio
 	reg.Register(mcp.Resource{
 		URI:         tools.StatusURI(id),
 		Name:        "Session " + id + " Status",
-		Description: "State of SSH session " + id + ": whether it is alive and at a prompt, the command that opened it, the prompt regex in effect, whether sentinel framing is available, and how many commands have run.",
+		Description: "State of session " + id + ": whether it is alive and at a prompt, the command that opened it, the prompt regex in effect, whether sentinel framing is available, and how many commands have run.",
 		MimeType:    "application/json",
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
 		b, err := json.MarshalIndent(sess.Status(), "", "  ")
@@ -389,7 +413,7 @@ func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *sessio
 	reg.Register(mcp.Resource{
 		URI:  tools.TranscriptURI(id),
 		Name: "Session " + id + " Transcript",
-		Description: "Recent raw bytes emitted by SSH session " + id + "'s remote shell, escape sequences intact, for diagnosing a prompt regex that does not match. " +
+		Description: "Recent raw bytes emitted by session " + id + "'s remote shell, escape sequences intact, for diagnosing a prompt regex that does not match. " +
 			"WARNING: this is verbatim terminal output and may contain command output, hostnames, or secrets that were printed to the shell.",
 		MimeType: "text/plain",
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
@@ -397,8 +421,8 @@ func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *sessio
 	})
 }
 
-func instructions(requireConfirmation, parametric bool) string {
-	s := "Runs commands on remote hosts through persistent SSH shell sessions. " +
+func instructions(requireConfirmation, parametric, gated bool) string {
+	s := "Runs commands on remote hosts through persistent shell sessions. " +
 		"Nothing is connected when this server starts: call start_session to open a session and get its id, pass that id to run_bash for every command, and call end_session when finished. " +
 		"Sessions are capped, and each one is a real privileged login held open on the remote side, so end them rather than abandoning them. "
 	if parametric {
@@ -409,6 +433,10 @@ func instructions(requireConfirmation, parametric bool) string {
 		"If a session reports state \"awaiting_prompt\", or run_bash says the prompt regex has not matched, read that session's transcript resource to see what the shell printed and repair the pattern with tune_prompt_regex."
 	if requireConfirmation {
 		s += " Every run_bash call requires the caller to confirm the exact command via an elicitation round trip before it executes — clients must declare the elicitation capability."
+	}
+	if gated {
+		s += " The operator can administratively disable this server at any moment, including mid-conversation: start_session and run_bash then refuse with an error saying so, and open sessions are terminated as soon as they finish whatever they were running. " +
+			"That is a deliberate stop, not a fault — it needs a person to clear, so report it and do not retry. is_disabled_by_flag answers whether that is what has happened, and both it and list_sessions keep working throughout."
 	}
 	return s
 }

@@ -120,6 +120,12 @@ func HelpConfig() string {
 	b.WriteString("  when a session will not log in. A relative path resolves against the\n")
 	b.WriteString("  server's working directory, which the client chooses; use an absolute path\n")
 	b.WriteString("  if you are not sure what that will be.\n\n")
+	b.WriteString("  ssh.disable_flag_file is an administrative kill switch, and off unless you\n")
+	b.WriteString("  name a path. While a file exists there, start_session and run_bash refuse\n")
+	b.WriteString("  with an error saying so, and sessions already open are terminated as soon\n")
+	b.WriteString("  as they stop running whatever they are running. Removing the file resumes\n")
+	b.WriteString("  service with no restart. Only the file's existence matters — its contents\n")
+	b.WriteString("  are never read — so touch and rm are the whole interface.\n\n")
 	fmt.Fprintf(&b, "  Other keys worth knowing: login_timeout (%s), command_timeout (%s),\n",
 		DefaultLoginTimeout, DefaultCommandTimeout)
 	fmt.Fprintf(&b, "  max_sessions (%d), idle_timeout (0 = never reap), require_confirmation,\n", DefaultMaxSessions)

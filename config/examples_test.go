@@ -143,3 +143,44 @@ func TestHelpConfigPointsAtAResolvableReference(t *testing.T) {
 		t.Errorf("--help-config mentions %q outside of the full URL; a reader with no checkout cannot resolve that", bare)
 	}
 }
+
+// --help-config is read by an operator before anything else, so it sets the vocabulary. SSH
+// belongs in it exactly three ways: as the name of the `ssh:` config block, as an example
+// command *value*, and inside this project's own name. It must never describe what a session
+// *is* — a session is a PTY and a prompt regex, and the transport that opens one is a
+// configuration detail that can change without any of the rest of this changing.
+//
+// The tool descriptions and resource text are held to the same rule by
+// tools.TestToolDefinitionsDoNotNameTheTransport and the matching test in package main;
+// this is the operator-facing half of the same scrub.
+func TestHelpConfigNamesSSHOnlyAsConfigurationNeverAsConcept(t *testing.T) {
+	out := HelpConfig()
+
+	// Uppercase is prose: the config keys and the example command lines are all lowercase,
+	// so an "SSH" here can only be someone describing the thing rather than naming a key.
+	if strings.Contains(out, "SSH") {
+		t.Error("--help-config contains \"SSH\" in prose; sessions are not SSH-specific")
+	}
+
+	lower := strings.ToLower(out)
+	for i := 0; ; {
+		j := strings.Index(lower[i:], "ssh")
+		if j < 0 {
+			break
+		}
+		at := i + j
+		i = at + 3
+
+		rest := out[at+3:]
+		switch {
+		case strings.HasSuffix(out[:at], "over-"): // mcp-linux-over-ssh, and its repo URL
+		case strings.HasPrefix(rest, ":"): // the ssh: block
+		case strings.HasPrefix(rest, "."): // ssh.command, ssh.parameters, ...
+		case strings.HasPrefix(rest, " -"): // an example command value: ssh -tt ...
+		default:
+			start := max(at-50, 0)
+			end := min(at+50, len(out))
+			t.Errorf("--help-config uses ssh as prose rather than as a key, a command value or this project's name: ...%s...", out[start:end])
+		}
+	}
+}

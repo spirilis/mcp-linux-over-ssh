@@ -303,3 +303,158 @@ Both states are bounded by their own timeouts, so neither defers reaping indefin
 - A parametric `prompt_regex` that cannot compile is only caught at `start_session`, not at
   startup. With no parameters declared the original startup check is unchanged.
 - The reconnect path (`allow_reconnect: true`) still has no automated test.
+
+## Feature: administrative disable flag file (2026-08-14)
+
+A file on the server's filesystem that, while it exists, is a kill switch: no new sessions
+may be opened, no commands may run on the ones already open, and those sessions are torn
+down as soon as they are not mid-command. Removing the file restores normal service.
+Entirely optional — omit `ssh.disable_flag_file` and nothing about this exists.
+
+### Tasks
+
+- [x] **`config`** — `ssh.disable_flag_file` (path, empty = feature off) and
+      `ssh.disable_flag_poll_interval` (default 5s, bounds only how long an *open* session
+      outlives the flag; tool calls stat the file directly and are never stale).
+- [x] **`session/gate.go`** — `Gate` interface (`Blocked() error`, nil = permitted) and
+      `FlagFileGate`, which stats on demand rather than caching, resolves its path to
+      absolute at construction, and **fails closed** on a stat error that is not
+      "not exist". `ErrDisabled` is the sentinel; its message is the phrase the request
+      asked for, verbatim.
+- [x] **`session/manager.go`** — `SetGate(g, poll)`, `Blocked()`, `Gated()`. `Start` checks
+      the gate before the cap. A `enforceGate` goroutine polls and ends every session that
+      is not `StateBusy`; a busy one is left for a later tick, which is precisely
+      "terminated once in-flight commands complete" — nothing new can start on it because
+      run_bash consults the gate too. Refactor `idleCandidates` onto a shared `refs()`
+      snapshot helper.
+- [x] **`tools/start_session.go`, `tools/run_bash.go`** — refuse first thing in the
+      handler, before binding arguments, with a message that names the flag file and says
+      it needs user intervention. run_bash's check precedes the MRTR elicitation, and is
+      re-run on the confirmation replay.
+- [x] **`tools/list_sessions.go`** — report the block, so the model can see *why* its
+      sessions vanished rather than only that they did. Additive to both the text and the
+      structured output.
+- [x] **`main.go`** — arm the gate before the tools are registered (their descriptions
+      depend on whether one exists), log the resolved absolute path, and warn loudly at
+      startup if the flag is already set.
+- [x] **Docs** — `config.yaml.example`, `--help-config` notes, `README.md`, `CLAUDE.md`.
+- [x] **Tests** — `session/gate_test.go` (runs under `-short`; no shell needed) and manager
+      tests for refusal, for busy-session deferral, and for release when the file is removed.
+- [x] **Verify** — build, vet, `go test ./... -race`, and an end-to-end run over real stdio
+      that creates the flag file mid-session.
+
+### Review
+
+Built as planned; nothing in the design had to change once it met a real shell.
+
+The one decision worth recording is the split enforcement. It would have been simpler to
+poll the flag file once and have everything read the cached answer, and it would have been
+wrong: a kill switch whose refusal lags by up to a poll interval lets commands through
+*after* someone has pulled it, which is the one moment it has to be exact. So the tools and
+`Manager.Start` stat the file on every call — a syscall nobody will measure — and the poll
+loop exists only for the sessions no call ever touches. `disable_flag_poll_interval` is
+documented in those terms, since "how fast does the flag take effect?" otherwise has two
+different answers and the config key looks like it controls both.
+
+Second decision: the gate fails **closed**. A stat error that is not "does not exist" —
+unreadable parent directory, wedged mount — counts as disabled, and says `could not be
+checked` so an operator can tell the two apart. A control that silently disarms itself when
+its own check breaks is worse than no control, given what is on the other end of these
+sessions.
+
+Third: `list_sessions`, `end_session` and `tune_prompt_regex` are deliberately left working
+while blocked. Only opening sessions and executing commands stop. `list_sessions` is where a
+model goes to find out why its sessions evaporated, and refusing that would leave it with the
+disappearance and no cause — so it reports the block in both its text and its structured
+output instead.
+
+### Verification performed
+
+- `go build ./...`, `go vet ./...`, `gofmt -l .` clean.
+- `go test ./... -race -count=1` green, including six new `FlagFileGate` tests (which need
+  no shell and so run under `-short`) and three new manager tests.
+- Mutation-tested the assertion that matters: deleting the `StateBusy` skip from
+  `gateCandidates` makes `TestManagerGateTerminatesIdleSessionsAndWaitsForBusyOnes` fail
+  with "a session running a command was terminated instead of being left to finish", then
+  restored.
+- 16-check end-to-end run over the real stdio protocol against the built binary, raising the
+  flag file *while a `sleep 6` was in flight*: the tool descriptions carry the warning, the
+  in-flight command completed normally, `run_bash` and `start_session` both refused with the
+  exact phrase, `list_sessions` kept answering and reported the reason, the session was aged
+  out only after its command finished, removing the file restored service with no restart,
+  and the server still exited cleanly on stdin close.
+- `config.yaml.example` re-loaded through the built binary (`tools/list` against it) after
+  the new keys were added, per the lesson that shipped configuration is code.
+
+#### Deliberately not done
+
+- **The `mcp+stdio:///sessions` resource still returns a bare array** and carries no disabled
+  flag. Adding one means reshaping it into an object, which is a breaking change to a
+  published resource for a signal `list_sessions` already delivers. Worth revisiting if that
+  resource is ever versioned for another reason.
+- **`serverVersion` was not bumped.** This is a feature, so the next tag should be `v0.3.0`
+  and `main.go` must move with it — see the tag == `serverVersion` invariant.
+
+### Follow-up: `is_disabled_by_flag` tool (2026-08-14)
+
+- [x] **`tools/is_disabled.go`** — no arguments, returns `{"disabled": bool}` plus a
+      `reason` naming the flag file when true. `ReadOnlyHint`/`IdempotentHint` on,
+      `OpenWorldHint` off.
+- [x] **Registered in `main.go` only when `mgr.Gated()`.** Its absence from `tools/list` is
+      then the answer to whether this server can be stopped that way at all — a missing tool
+      cannot be misread, whereas a permanently-false check on every deployment teaches a
+      caller to skip it on the ones where it means something.
+- [x] The `reason` is withheld when not disabled. There is nothing to act on in that case,
+      and the path to a kill switch is not worth handing to a caller that is at that moment
+      free to run commands. The server host and an SSH target are usually different machines
+      — but nothing in the config guarantees it.
+- [x] `disabledToolNote` and the server instructions now point at it, so a model that meets
+      a refusal has somewhere to confirm the cause before reporting it.
+- [x] Verified: build, vet, gofmt, `go test ./... -race` all clean, and the end-to-end driver
+      grew to 26 checks — the tool is advertised only with a flag file configured, reads
+      false then true then false again across a raise/clear cycle, withholds the path while
+      false, names it while true, and a second server started from a config with no
+      `disable_flag_file` advertises exactly the other five tools and not this one.
+
+### Follow-up: scrub "SSH" from protocol text (2026-08-14)
+
+SSH is how a session gets opened; it is not what a session is. Every "SSH session" in
+client-facing text was a promise this server does not make, and one that would have to be
+broken in the most expensive place — the description a deployed client cached from its
+`initialize`.
+
+- [x] **Tool titles** — "Open SSH Session" → "Open Session", "List SSH Sessions" → "List
+      Sessions", "Close SSH Session" → "Close Session", "Run Command Over SSH" → "Run Remote
+      Command". Both the `Title` and the duplicate in `Annotations.Title`.
+- [x] **Tool descriptions** — start_session, list_sessions, end_session, run_bash.
+- [x] **`start_session`'s result text** — "The SSH login is still in progress… on a bastion"
+      → "The login is still in progress… on a target".
+- [x] **Resources** — the index's name and description, and both per-session descriptions.
+- [x] **Server instructions.**
+- [x] **`session.ErrDead`**, which reaches the client through run_bash. Also corrected while
+      there: it still said "restart the server", which stopped being true when sessions
+      became per-call. Now "start a new session".
+- [x] **`--help-config` needed no prose change.** Every `ssh` in it is the `ssh:` key,
+      `ssh.<key>`, an example command value, or this project's name — verified by dumping
+      every occurrence with context rather than by reading.
+- [x] **Three guard tests**, each mutation-checked by reintroducing an "SSH" and confirming
+      the failure message names what to edit: `tools/vocabulary_test.go` (the first Go test
+      in that package — it needs no shell, since building a definition spawns nothing),
+      `main_test.go`, and a `--help-config` check that permits `ssh` only as configuration.
+
+The `ssh:` config block keeps its name. Renaming it breaks every deployed config for a
+cosmetic gain, and an operator writing `command:` is genuinely choosing a transport. SSH is a
+configuration concept here, never a protocol one.
+
+#### Verification
+
+- Build, vet, gofmt, `go test ./... -race` clean; the 26-check flag-file end-to-end still
+  passes unchanged.
+- Drove the real binary over stdio and dumped every title, resource name and the instructions
+  from the wire: the only `ssh` left in the whole `initialize` + `tools/list` +
+  `resources/list` output is the server's own name, `mcp-linux-over-ssh`.
+
+#### Left alone, deliberately
+
+- `README.md`, `CLAUDE.md` and `config.yaml.example`. These are read by people, describe what
+  the server actually does today, and are not protocol.
