@@ -140,3 +140,29 @@ func TestLoadTranscriptDisabled(t *testing.T) {
 		t.Errorf("transcript_bytes = %d, want 0 (disabled)", cfg.SSH.TranscriptBytes)
 	}
 }
+
+// logging.file is read by this package, not the library, from the same logging: block
+// the library reads level/format from.
+func TestLoadParsesLoggingFile(t *testing.T) {
+	cfg, err := Load(write(t, minimal+"logging:\n  file: /var/log/mcp-linux-over-ssh.log\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Logging.File != "/var/log/mcp-linux-over-ssh.log" {
+		t.Errorf("logging.file = %q, want /var/log/mcp-linux-over-ssh.log", cfg.Logging.File)
+	}
+	// The library's own parse of the same block must not choke on the extra key.
+	if cfg.Lib.Logging.Level != "info" {
+		t.Errorf("logging.level = %q, want default info", cfg.Lib.Logging.Level)
+	}
+}
+
+func TestLoadLoggingFileDefaultsEmpty(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Logging.File != "" {
+		t.Errorf("logging.file = %q, want empty (stderr)", cfg.Logging.File)
+	}
+}

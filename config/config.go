@@ -1,9 +1,10 @@
 // Package config loads mcp-linux-over-ssh's configuration.
 //
 // The same YAML file feeds two parsers: generic-go-mcp's own config.Load reads the
-// server: and logging: blocks, and this package reads the ssh: block. The library's
-// config.Config has no extension point, so a second unmarshal of the same file is the
-// least surprising way to carry our own settings.
+// server: and logging: blocks, and this package reads the ssh: block, plus a couple of
+// fields the library's logging: block doesn't have room for (see LoggingConfig). The
+// library's config.Config has no extension point, so a second unmarshal of the same file
+// is the least surprising way to carry our own settings.
 package config
 
 import (
@@ -54,14 +55,27 @@ type SSHConfig struct {
 	RequireConfirmation *bool `yaml:"require_confirmation"`
 }
 
+// LoggingConfig carries the logging: fields the library's own LoggingConfig has no room
+// for. It is unmarshalled from the same logging: block as the library's level/format —
+// yaml.Unmarshal ignores keys a struct doesn't declare, so the two parsers coexist without
+// either seeing an "unknown field" error.
+type LoggingConfig struct {
+	// File redirects logging from stderr (the default) to this path, opened for append
+	// and created if missing. Empty means stderr, unchanged from before this field
+	// existed.
+	File string `yaml:"file"`
+}
+
 // Config is the whole file: the library's half plus ours.
 type Config struct {
-	Lib *libconfig.Config
-	SSH SSHConfig
+	Lib     *libconfig.Config
+	SSH     SSHConfig
+	Logging LoggingConfig
 }
 
 type fileEnvelope struct {
-	SSH SSHConfig `yaml:"ssh"`
+	SSH     SSHConfig     `yaml:"ssh"`
+	Logging LoggingConfig `yaml:"logging"`
 }
 
 // Defaults applied to any field the file leaves unset.
@@ -98,7 +112,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse ssh config: %w", err)
 	}
 
-	cfg := &Config{Lib: lib, SSH: env.SSH}
+	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging}
 	if err := cfg.SSH.applyDefaults(); err != nil {
 		return nil, err
 	}

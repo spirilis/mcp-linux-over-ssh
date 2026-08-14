@@ -12,6 +12,9 @@ logging:
   level: info
   # text | json
   format: text
+  # Optional. Redirect logging from stderr to this path instead (opened for append,
+  # created if missing). This key is read by mcp-linux-over-ssh itself, not the library.
+  # file: /var/log/mcp-linux-over-ssh.log
 
 ssh:
   # The command that opens the session, run once via `sh -c` for the process lifetime.

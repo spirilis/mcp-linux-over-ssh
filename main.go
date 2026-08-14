@@ -57,9 +57,22 @@ func main() {
 	if *logLevel != "" {
 		level = *logLevel
 	}
-	// Logging goes to stderr; stdout belongs to the JSON-RPC stream and nothing else in
-	// this process may write to it.
-	logging.Initialize(level, cfg.Lib.Logging.Format)
+	// Logging goes to stderr by default, or to logging.file if the config sets one;
+	// stdout belongs to the JSON-RPC stream and nothing else in this process may write to
+	// it. logging.Initialize takes the writer directly as of generic-go-mcp v0.4.0 (see
+	// config.LoggingConfig for why the file path itself lives outside the library's own
+	// logging: block).
+	var logOut io.Writer
+	if cfg.Logging.File != "" {
+		logFile, err := os.OpenFile(cfg.Logging.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening logging.file %q: %v\n", cfg.Logging.File, err)
+			os.Exit(1)
+		}
+		defer logFile.Close()
+		logOut = logFile
+	}
+	logging.Initialize(level, cfg.Lib.Logging.Format, logOut)
 
 	if cfg.Lib.Server.Mode != "stdio" {
 		logging.Error("this server is stdio-only", "configured_mode", cfg.Lib.Server.Mode)
@@ -85,13 +98,6 @@ func main() {
 		logging.Error("invalid session configuration", "error", err)
 		os.Exit(1)
 	}
-
-	// Start before serving: the handshake runs commands through the same single-flight
-	// path the tools use, and it must not race an incoming tools/call.
-	if err := sess.Start(context.Background()); err != nil {
-		logging.Error("could not start the shell session", "error", err)
-		os.Exit(1)
-	}
 	defer sess.Close()
 
 	registry := mcp.NewToolRegistry()
@@ -109,8 +115,9 @@ func main() {
 
 	// After NewServer, which is what attaches the registry to the notification broker: a
 	// NotifyUpdated on a detached registry reaches nobody. The session only changes state
-	// from the reader goroutine or a tool call, neither of which can run before this point,
-	// so nothing is missed by installing the observer here.
+	// from the reader goroutine or a tool call, and installing the observer before the
+	// session is spawned below means subscribers see the login handshake's own state
+	// transitions instead of missing all of them.
 	sess.SetStatusObserver(func(st session.Status) {
 		// busy/ready is two lines per command and tells an operator nothing; the states
 		// worth waking up for are the ones that need a human or a repair.
@@ -141,8 +148,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The SSH login handshake runs after the transport is already serving requests, not
+	// before it. An MCP client's own connect timeout is commonly much shorter than
+	// login_timeout, and a bastion login is exactly the kind of thing that can take a
+	// while (banners, MFA, PAM dispatch) — blocking the transport on it made every slow
+	// login look like a dead server. Tool calls that land before the handshake finishes
+	// already fail cleanly through checkRunnable (StateStarting/StateAwaitingPrompt), so
+	// there is nothing left for a stricter ordering to protect against.
+	go func() {
+		if err := sess.Start(context.Background()); err != nil {
+			logging.Error("could not start the shell session", "error", err)
+			_ = trans.Stop()
+			_ = sess.Close()
+			os.Exit(1)
+		}
+	}()
+
 	logging.Info("MCP server ready on stdio",
-		"session_state", sess.Status().State,
 		"require_confirmation", cfg.SSH.RequireConfirmationValue())
 
 	sigCh := make(chan os.Signal, 1)
