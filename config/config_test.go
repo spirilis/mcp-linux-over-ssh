@@ -24,6 +24,15 @@ ssh:
   prompt_regex: '(?m)^[^\n]*[$#]\s*$'
 `
 
+// sshBlock is the ssh: portion alone, for tests that need to supply their own server:
+// block rather than appending to minimal's (a second top-level server: key would be a
+// duplicate YAML key, not a merge).
+const sshBlock = `
+ssh:
+  command: "ssh -tt user@bastion"
+  prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+`
+
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg, err := Load(write(t, minimal))
 	if err != nil {
@@ -49,19 +58,27 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		t.Errorf("init_commands = %v, want %v", cfg.SSH.InitCommands, DefaultInitCommands)
 	}
 
-	// Both default to on, and an omitted key must not read as false.
+	// use_sentinel defaults to on, and an omitted key must not read as false.
 	if !cfg.SSH.UseSentinelValue() {
 		t.Error("use_sentinel should default to true")
-	}
-	if !cfg.SSH.RequireConfirmationValue() {
-		t.Error("require_confirmation should default to true")
 	}
 	if cfg.SSH.AllowReconnect {
 		t.Error("allow_reconnect should default to false")
 	}
+
+	// legacy_compat defaults to on (the inverse of the library's own default), and with
+	// no explicit require_confirmation, confirmation follows it: MRTR has no legacy
+	// equivalent, so a minimal config gets a usable run_bash for a legacy client rather
+	// than one that requires a confirmation round trip it can never complete.
+	if !cfg.LegacyCompatEnabled() {
+		t.Error("legacy_compat should default to true")
+	}
+	if cfg.SSH.RequireConfirmationValue(cfg.LegacyCompatEnabled()) {
+		t.Error("require_confirmation should default to false when legacy_compat is enabled")
+	}
 }
 
-// The two tri-state settings are the ones where "absent" and "false" must not be confused:
+// The tri-state settings are the ones where "absent" and "false" must not be confused:
 // silently defaulting an explicit `false` back to true would re-enable a confirmation the
 // operator deliberately turned off.
 func TestLoadHonoursExplicitFalse(t *testing.T) {
@@ -76,11 +93,71 @@ func TestLoadHonoursExplicitFalse(t *testing.T) {
 	if cfg.SSH.UseSentinelValue() {
 		t.Error("explicit use_sentinel: false was not honoured")
 	}
-	if cfg.SSH.RequireConfirmationValue() {
+	if cfg.SSH.RequireConfirmationValue(cfg.LegacyCompatEnabled()) {
 		t.Error("explicit require_confirmation: false was not honoured")
 	}
 	if !cfg.SSH.AllowReconnect {
 		t.Error("allow_reconnect: true was not honoured")
+	}
+}
+
+// An explicit require_confirmation: true must survive even though legacy_compat defaults
+// to on — the operator asked for confirmation, and it still works for any caller that did
+// negotiate 2026-07-28 (a legacy caller gets the documented MRTR refusal instead, which is
+// its own explicit choice to accept once it sets this).
+func TestLoadExplicitRequireConfirmationOverridesCompatDefault(t *testing.T) {
+	cfg, err := Load(write(t, minimal+"  require_confirmation: true\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.LegacyCompatEnabled() {
+		t.Fatal("legacy_compat should still default to true")
+	}
+	if !cfg.SSH.RequireConfirmationValue(cfg.LegacyCompatEnabled()) {
+		t.Error("explicit require_confirmation: true was not honoured despite legacy_compat being on")
+	}
+}
+
+func TestLoadLegacyCompatCanBeDisabled(t *testing.T) {
+	body := "server:\n  mode: stdio\n  legacy_compat:\n    enabled: false\n" + sshBlock
+	cfg, err := Load(write(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LegacyCompatEnabled() {
+		t.Error("explicit legacy_compat.enabled: false was not honoured")
+	}
+	// With compat off, require_confirmation reverts to its original always-on default.
+	if !cfg.SSH.RequireConfirmationValue(cfg.LegacyCompatEnabled()) {
+		t.Error("require_confirmation should default to true when legacy_compat is disabled")
+	}
+}
+
+func TestLoadLegacyCompatSessionTTL(t *testing.T) {
+	body := "server:\n  mode: stdio\n  legacy_compat:\n    enabled: true\n    session_ttl: 45m\n" + sshBlock
+	cfg, err := Load(write(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.LegacyCompatSessionTTL(), 45*time.Minute; got != want {
+		t.Errorf("legacy_compat.session_ttl = %v, want %v", got, want)
+	}
+}
+
+func TestLoadLegacyCompatSessionTTLDefaultsZero(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.LegacyCompatSessionTTL(); got != 0 {
+		t.Errorf("legacy_compat.session_ttl = %v, want 0 (compat.Overlay's own default)", got)
+	}
+}
+
+func TestLoadRejectsBadLegacyCompatSessionTTL(t *testing.T) {
+	body := "server:\n  mode: stdio\n  legacy_compat:\n    session_ttl: not-a-duration\n" + sshBlock
+	if _, err := Load(write(t, body)); err == nil {
+		t.Error("expected an error for an unparseable session_ttl")
 	}
 }
 

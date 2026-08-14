@@ -7,6 +7,23 @@ server:
   # stdio is the only mode this server supports.
   mode: stdio
 
+  # Optional. Also accept MCP clients still on a connection-scoped protocol revision
+  # (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05) alongside this server's native
+  # 2026-07-28 support, via generic-go-mcp's compat.Overlay. On by default here — the
+  # inverse of the library's own default — because most MCP clients as of this writing
+  # (Claude Desktop, most IDEs) still speak one of those revisions; omit this block
+  # entirely and compat stays on. Set enabled: false once every client that reaches this
+  # server has moved to 2026-07-28.
+  #
+  # The one thing that does not translate across the compat boundary: MRTR (the run_bash
+  # confirmation below) has no legacy equivalent, so a legacy caller gets a visible error
+  # instead of the confirmation round trip. See ssh.require_confirmation.
+  legacy_compat:
+    enabled: true
+    # How long an idle legacy client's session survives before it is swept. Empty/omitted
+    # uses compat.Overlay's own 30-minute default.
+    # session_ttl: 30m
+
 logging:
   # trace | debug | info | warn | error. Logs go to stderr; stdout carries JSON-RPC.
   level: info
@@ -77,5 +94,9 @@ ssh:
 
   # Require the caller to confirm each command via an MRTR elicitation before it runs.
   # With this on, clients that do not declare the elicitation capability cannot use
-  # run_bash at all.
+  # run_bash at all. Left unset (comment this out), the default tracks
+  # server.legacy_compat.enabled above: false while compat is on, since a legacy client
+  # has no way to answer the confirmation round trip and would otherwise be unable to use
+  # run_bash at all; true otherwise, unchanged from before compat existed. Set explicitly,
+  # as below, to pin it either way regardless of compat mode.
   require_confirmation: true

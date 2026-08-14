@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	"github.com/spirilis/generic-go-mcp/compat"
 	"github.com/spirilis/generic-go-mcp/logging"
 	"github.com/spirilis/generic-go-mcp/mcp"
 	"github.com/spirilis/generic-go-mcp/transport"
@@ -79,6 +80,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	compatEnabled := cfg.LegacyCompatEnabled()
+	requireConfirmation := cfg.SSH.RequireConfirmationValue(compatEnabled)
+	if !requireConfirmation && cfg.SSH.RequireConfirmation == nil {
+		// The operator never set require_confirmation either way; it only came out false
+		// because legacy compat is on and MRTR has no legacy equivalent. Surface that
+		// loudly rather than silently changing the security posture of an existing
+		// deployment that upgrades and picks up the new default.
+		logging.Warn("require_confirmation defaulted to false because legacy MCP compatibility is enabled and MRTR confirmation cannot reach a pre-2026-07-28 client; set require_confirmation explicitly in the config to override")
+	}
+
 	sess, err := session.New(session.Config{
 		Command:         cfg.SSH.Command,
 		PromptRegex:     cfg.SSH.PromptRegex,
@@ -101,17 +112,24 @@ func main() {
 	defer sess.Close()
 
 	registry := mcp.NewToolRegistry()
-	registry.Register(tools.NewRunBash(sess, cfg.SSH.RequireConfirmationValue()))
+	registry.Register(tools.NewRunBash(sess, requireConfirmation))
 	registry.Register(tools.NewTunePromptRegex(sess))
 
 	resourceRegistry := mcp.NewResourceRegistry()
 	registerResources(resourceRegistry, sess)
 
-	server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
+	serverCfg := &mcp.ServerConfig{
 		Name:         serverName,
 		Version:      serverVersion,
-		Instructions: instructions(cfg.SSH.RequireConfirmationValue()),
-	})
+		Instructions: instructions(requireConfirmation),
+	}
+	if compatEnabled {
+		// Feed server/discover, the legacy initialize diagnostic, and -32022 from one
+		// list, so a client is never told three different stories about what this server
+		// speaks.
+		serverCfg.AdvertisedVersions = append([]string{mcp.ProtocolVersion}, compat.LegacyVersions...)
+	}
+	server := mcp.NewServer(registry, resourceRegistry, serverCfg)
 
 	// After NewServer, which is what attaches the registry to the notification broker: a
 	// NotifyUpdated on a detached registry reaches nobody. The session only changes state
@@ -128,7 +146,20 @@ func main() {
 		}
 		resourceRegistry.NotifyUpdated(statusURI)
 	})
-	handler := &drainingHandler{inner: server}
+
+	// Wrap server in the legacy-compat overlay, not the other way around: the overlay
+	// translates a pre-2026-07-28 request into the modern wire shape and forwards it to
+	// server unchanged, so everything above this line (tools, resources, the status
+	// observer) stays oblivious to which era a given caller is on.
+	var handlerInner transport.MessageHandler = server
+	if compatEnabled {
+		handlerInner = compat.New(server, compat.Config{
+			SessionTTL: cfg.LegacyCompatSessionTTL(),
+			ServerInfo: mcp.Implementation{Name: serverName, Version: serverVersion},
+		})
+		logging.Info("legacy MCP compatibility enabled", "advertised_versions", serverCfg.AdvertisedVersions)
+	}
+	handler := &drainingHandler{inner: handlerInner}
 
 	// Interpose a pipe on stdin before the transport claims it, so this process can see
 	// the client close it. Closing stdin is the spec's shutdown signal for a stdio server,
@@ -165,7 +196,8 @@ func main() {
 	}()
 
 	logging.Info("MCP server ready on stdio",
-		"require_confirmation", cfg.SSH.RequireConfirmationValue())
+		"require_confirmation", requireConfirmation,
+		"legacy_compat", compatEnabled)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

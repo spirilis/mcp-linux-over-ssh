@@ -51,7 +51,9 @@ type SSHConfig struct {
 	AllowReconnect bool `yaml:"allow_reconnect"`
 
 	// RequireConfirmation gates every execution behind an MRTR elicitation. Pointer so
-	// an explicit `false` is distinguishable from an omitted key (default true).
+	// an explicit `false` is distinguishable from an omitted key. Default is true unless
+	// legacy MCP compatibility is on, in which case it is false — see
+	// RequireConfirmationValue.
 	RequireConfirmation *bool `yaml:"require_confirmation"`
 }
 
@@ -102,6 +104,19 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// The library defaults legacy MCP compatibility to off; this server inverts that
+	// default (see LegacyCompatEnabled), so an omitted block means "on" here rather than
+	// falling through to the library's off. An explicit server.legacy_compat.enabled in
+	// the file, true or false, always wins over this.
+	if lib.Server.LegacyCompat == nil {
+		lib.Server.LegacyCompat = &libconfig.LegacyCompatConfig{Enabled: true}
+	}
+	if lib.Server.LegacyCompat.SessionTTL != "" {
+		if _, err := time.ParseDuration(lib.Server.LegacyCompat.SessionTTL); err != nil {
+			return nil, fmt.Errorf("server.legacy_compat.session_ttl does not parse: %w", err)
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -124,9 +139,38 @@ func (c *SSHConfig) UseSentinelValue() bool {
 	return c.UseSentinel == nil || *c.UseSentinel
 }
 
-// RequireConfirmationValue reports whether every execution needs an MRTR confirmation.
-func (c *SSHConfig) RequireConfirmationValue() bool {
-	return c.RequireConfirmation == nil || *c.RequireConfirmation
+// RequireConfirmationValue reports whether every execution needs an MRTR confirmation. An
+// explicit require_confirmation in the config always wins. Left unset, the default tracks
+// legacyCompatEnabled: MRTR (mcp.ToolRequest.NeedInput) has no legacy-MCP equivalent — a
+// pre-2026-07-28 client gets a visible isError refusal on every run_bash call instead of the
+// confirmation round trip (see compat.Overlay's result downgrading) — so confirmation
+// defaults off while compat is on, and on otherwise, same as before this field existed.
+func (c *SSHConfig) RequireConfirmationValue(legacyCompatEnabled bool) bool {
+	if c.RequireConfirmation != nil {
+		return *c.RequireConfirmation
+	}
+	return !legacyCompatEnabled
+}
+
+// LegacyCompatEnabled reports whether the legacy (2025-11-25 and earlier) MCP
+// compatibility overlay (compat.Overlay) is active. On by default — the inverse of the
+// library's own default — since most MCP clients as of this writing (Claude Desktop, most
+// IDEs) do not yet speak 2026-07-28, and this server exists to keep working with the
+// clients already deployed against it. Set server.legacy_compat.enabled: false once every
+// client this server serves has moved off the legacy revisions.
+func (c *Config) LegacyCompatEnabled() bool {
+	return c.Lib.Server.LegacyCompat.Enabled
+}
+
+// LegacyCompatSessionTTL is server.legacy_compat.session_ttl, parsed. Load has already
+// validated it parses; an empty string returns zero, which lets compat.Overlay apply its
+// own 30-minute default.
+func (c *Config) LegacyCompatSessionTTL() time.Duration {
+	if c.Lib.Server.LegacyCompat.SessionTTL == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(c.Lib.Server.LegacyCompat.SessionTTL)
+	return d
 }
 
 func (c *SSHConfig) applyDefaults() error {
