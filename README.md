@@ -53,6 +53,17 @@ Run it:
 mcp-linux-over-ssh --config config.yaml
 ```
 
+To check which build you actually have — `go install …@latest` gives no direct feedback
+about what it resolved:
+
+```
+mcp-linux-over-ssh --version
+```
+
+It prints the version reported to MCP clients, the module version the Go toolchain
+recorded, the commit when built from a checkout, and the MCP protocol revision. Those
+first two come from different places, so it says so plainly if they disagree.
+
 The server speaks JSON-RPC over stdio, so it's normally launched by an MCP client rather
 than run interactively. For local development without a real bastion, point
 `ssh.command` at `bash --norc --noprofile -i` — it's a PTY session that prints a prompt

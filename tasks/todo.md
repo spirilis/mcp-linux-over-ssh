@@ -458,3 +458,35 @@ configuration concept here, never a protocol one.
 
 - `README.md`, `CLAUDE.md` and `config.yaml.example`. These are read by people, describe what
   the server actually does today, and are not protocol.
+
+### Follow-up: `--version` (2026-08-14)
+
+`go install ...@latest` reports what it downloaded and then nothing; there was no way to ask
+the resulting binary what it is.
+
+- [x] **`--version`**, checked alongside `--help-config` before `--config` is required, and
+      returning before the transport exists (so stdout is correct there).
+- [x] **It prints two versions, not one.** `serverVersion` is a constant in `main.go` and is
+      what clients are told; `debug.ReadBuildInfo().Main.Version` is what the toolchain
+      resolved. Only the second can answer the question that prompted this, and the two are
+      maintained by different mechanisms — they drifted in this repo before, when the tags
+      read `v0.0.x` and the source said `0.1.0`. A clean release tag that disagrees with the
+      constant prints a `WARNING` naming both numbers.
+- [x] `releaseVersion` refuses to compare anything with `-` or `+` in it. A pseudo-version,
+      a prerelease or a `+dirty` local build is not expected to match the constant, and
+      warning on those would make the flag cry wolf on every developer's build.
+- [x] Also reports the commit and dirty flag when built from a checkout, the Go version and
+      platform, and `mcp.ProtocolVersion` — the last being what someone debugging a client
+      handshake actually wants.
+- [x] `renderVersion` takes its `*debug.BuildInfo` as a parameter instead of reading it, so
+      the drift case is testable. It is the one case a working tree cannot produce.
+
+#### Verification
+
+- Six new tests in `main_test.go` covering the mismatch warning, the four shapes that must
+  *not* warn, both provenance shapes (installed vs. checkout), the stripped-binary path, and
+  a `releaseVersion` table.
+- Eyeballed all four rendered shapes before shipping, not just asserted on substrings.
+- Confirmed empirically that `go install github.com/spirilis/mcp-linux-over-ssh@latest`
+  resolves to `v0.3.0` — and that the resulting binary rejects `--version`, which is exactly
+  the gap this closes.

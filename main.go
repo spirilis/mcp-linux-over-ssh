@@ -15,6 +15,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,7 +35,7 @@ import (
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.3.0"
+	serverVersion = "0.3.1"
 
 	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
 	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
@@ -45,14 +48,20 @@ func main() {
 	configPath := pflag.String("config", "", "Path to the YAML configuration file (required)")
 	logLevel := pflag.String("log-level", "", "Override logging.level from the config file")
 	helpConfig := pflag.Bool("help-config", false, "Print annotated example configurations and exit")
+	showVersion := pflag.Bool("version", false, "Print version and build information and exit")
 	pflag.Parse()
 
-	// Checked before --config is required, since not having one yet is the whole reason to
-	// ask. Writing to stdout does not break the "nothing may write to stdout" rule: that
-	// rule protects the JSON-RPC framing, and this path returns before the transport
-	// exists. Help a user explicitly asked for belongs on stdout so it can be piped.
+	// Both are checked before --config is required, since not having one yet is the whole
+	// reason to ask. Writing to stdout does not break the "nothing may write to stdout"
+	// rule: that rule protects the JSON-RPC framing, and these paths return before the
+	// transport exists. Output a user explicitly asked for belongs on stdout so it can be
+	// piped.
 	if *helpConfig {
 		fmt.Print(config.HelpConfig())
+		return
+	}
+	if *showVersion {
+		fmt.Print(versionInfo())
 		return
 	}
 
@@ -419,6 +428,106 @@ func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *sessio
 	}, func(context.Context) (mcp.ResourceContentResult, error) {
 		return mcp.ResourceContentResult{Text: string(sess.Transcript(0))}, nil
 	})
+}
+
+// versionInfo renders --version.
+func versionInfo() string {
+	bi, ok := debug.ReadBuildInfo()
+	return renderVersion(bi, ok)
+}
+
+// renderVersion reports what this binary is, and — the reason the flag exists — whether the
+// version it *claims* is the version it was actually built from.
+//
+// serverVersion is a constant in this source file, and it is what every MCP client is told
+// over initialize and server/discover. The Go toolchain separately records the module
+// version it resolved, and that is the only thing that can answer "did `@latest` give me
+// what I think it did?". The two are maintained by different mechanisms and have drifted
+// before in this repository — the tags read v0.0.x while the source said 0.1.0 — so this
+// prints both rather than picking one, and says so plainly when they disagree.
+//
+// Split out from versionInfo so the disagreement case is testable: it is precisely the case
+// that cannot be reproduced from a working tree.
+func renderVersion(bi *debug.BuildInfo, ok bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\n", serverName, serverVersion)
+
+	if !ok || bi == nil {
+		// Only reachable for a binary stripped of its build info. Nothing below can be
+		// stated, and guessing would defeat the point of asking.
+		b.WriteString("\n  No build information is embedded in this binary, so the module\n")
+		b.WriteString("  version it was installed from cannot be confirmed.\n")
+		return b.String()
+	}
+
+	module := bi.Main.Version
+	if module == "" {
+		module = "unknown"
+	}
+	fmt.Fprintf(&b, "\n  module:        %s %s\n", bi.Main.Path, module)
+	if module == "(devel)" {
+		b.WriteString("                 (built from a working tree, not `go install ...@version`)\n")
+	}
+
+	if rev, t, dirty := vcsInfo(bi); rev != "" {
+		fmt.Fprintf(&b, "  commit:        %s", rev)
+		if dirty {
+			b.WriteString(" (with uncommitted changes)")
+		}
+		if t != "" {
+			fmt.Fprintf(&b, "  %s", t)
+		}
+		b.WriteString("\n")
+	}
+
+	fmt.Fprintf(&b, "  built with:    %s  %s/%s\n", bi.GoVersion, runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(&b, "  MCP protocol:  %s\n", mcp.ProtocolVersion)
+	fmt.Fprintf(&b, "  reported to clients as version %s\n", serverVersion)
+
+	if tagged := releaseVersion(module); tagged != "" && tagged != serverVersion {
+		fmt.Fprintf(&b, "\n  WARNING: this binary was built from module version %s but reports\n", module)
+		fmt.Fprintf(&b, "  %s to MCP clients. The module version is the one to trust; the\n", serverVersion)
+		b.WriteString("  constant in the source was not updated when the tag was cut.\n")
+	}
+
+	return b.String()
+}
+
+// releaseVersion reduces a module version to the plain release it names, or "" when this
+// build carries no clean release tag at all.
+//
+// Anything with a prerelease or build-metadata suffix is a pseudo-version, a dirty tree or a
+// prerelease — none of which is expected to equal the constant in the source, so none of
+// them may raise the mismatch warning. Only an exact tag is comparable, and only an exact
+// tag is what somebody running `go install ...@latest` actually got.
+func releaseVersion(v string) string {
+	if v == "" || v == "(devel)" || v == "unknown" {
+		return ""
+	}
+	if strings.ContainsAny(v, "-+") {
+		return ""
+	}
+	return strings.TrimPrefix(v, "v")
+}
+
+// vcsInfo pulls the revision, commit time and dirty flag out of the build settings. All
+// three are absent from a `go install module@version` build, where the toolchain has a
+// version to record and no checkout to inspect.
+func vcsInfo(bi *debug.BuildInfo) (revision, when string, dirty bool) {
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+			if len(revision) > 12 {
+				revision = revision[:12]
+			}
+		case "vcs.time":
+			when = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	return revision, when, dirty
 }
 
 func instructions(requireConfirmation, parametric, gated bool) string {

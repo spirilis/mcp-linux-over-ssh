@@ -36,6 +36,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
 
 # Worked config examples (0, 1 and 2 parameters). No --config needed.
 ./mcp-linux-over-ssh --help-config
+
+# What this binary actually is: the version reported to clients, the module version the
+# toolchain resolved, the commit, and the MCP protocol revision. No --config needed.
+./mcp-linux-over-ssh --version
 ```
 
 Local development without a bastion: point `ssh.command` at `bash --norc --noprofile -i`. It is a PTY session that prints a prompt and echoes, so it exercises the same code path. To exercise the *parametric* path too, template it — `env MCPLABEL={{.label}} bash --norc --noprofile -i` with a `label` parameter proves per-session rendering and isolation with no bastion in the loop.
@@ -100,7 +104,8 @@ Screen-scraping hinges on recognising the prompt, and a regex written blind agai
 - `watchStdin` interposes an `os.Pipe` on `os.Stdin` before the transport claims it, so the server can notice its client closing stdin. Closing stdin is the spec's shutdown signal, but the transport reads `os.Stdin` directly and its `Stop` cannot interrupt a blocked read. Without this a `docker run -i` outlives its client forever, holding every open SSH session with it.
 - `drainingHandler` wraps the server to count in-flight requests, so shutdown-on-EOF waits for pending work instead of cancelling it. `printf '...' | mcp-linux-over-ssh` depends on this. It deliberately does *not* count `subscriptions/listen`: that stream lives until the transport stops, so counting it would spend the whole grace period on every shutdown that had a subscriber. The check sniffs `method` out of the raw frame, so a JSON-RPC *batch* (an array) reads as "not a listen" and is counted — the safe direction, and this binding sends one request per line anyway.
 - **A failure path that calls `os.Exit` must close the sessions first**, since `os.Exit` skips defers. `trans.Start`'s error path is the one place this bites. Nothing can be open that early any more, but the `mgr.CloseAll()` stays there so the invariant is local rather than resting on that argument staying true — leaving a shell to die of PTY hangup is not good enough when the far end is a privileged bastion session.
-- **Nothing may write to stdout.** The transport owns it for JSON-RPC framing; library logging goes to stderr.
+- **Nothing may write to stdout.** The transport owns it for JSON-RPC framing; library logging goes to stderr. `--help-config` and `--version` are the two exemptions, and both are exemptions for the same reason: they `return` before the transport exists, and output a user explicitly asked for belongs on stdout so it can be piped.
+- **`--version` prints two versions on purpose.** `serverVersion` is a constant in `main.go` and is what clients are told over `initialize`/`server/discover`; `debug.ReadBuildInfo().Main.Version` is what the Go toolchain resolved and is the only thing that can answer "did `go install …@latest` give me what I think it did?". Those are maintained by different mechanisms and have drifted here before (tags read `v0.0.x` while the source said `0.1.0`), so `--version` prints both and emits a `WARNING` naming both numbers when a *clean release tag* disagrees with the constant. `releaseVersion` deliberately refuses to compare anything carrying `-` or `+` — a pseudo-version, a prerelease, or a `+dirty` local build is not expected to match, and warning on those would make the flag cry wolf on every developer's build. `renderVersion` takes its `*debug.BuildInfo` as a parameter rather than reading it, which is what makes the drift case testable at all: it is precisely the case a working tree cannot reproduce.
 
 ### Protocol vocabulary: a session is never an "SSH session"
 
