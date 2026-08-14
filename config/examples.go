@@ -6,6 +6,14 @@ import (
 	"unicode/utf8"
 )
 
+// ExampleConfigURL is the fully commented reference configuration.
+//
+// Spelled out as a URL rather than as the bare filename "config.yaml.example", because the
+// people most likely to run --help-config are the ones with no repository checkout: someone
+// who ran `go install`, or who is pointing an MCP client at a container image. A filename
+// they cannot locate is not a reference.
+const ExampleConfigURL = "https://github.com/spirilis/mcp-linux-over-ssh/blob/main/config.yaml.example"
+
 // Example is one annotated configuration shown by --help-config.
 //
 // These are not prose. Every one is loaded and rendered by TestExamplesAllLoad, so an
@@ -31,8 +39,9 @@ func Examples() []Example {
 			Name:        "No parameters — one fixed target",
 			Description: "The command is a constant and start_session takes no arguments.",
 			Params:      0,
-			YAML: `server:
-  mode: stdio
+			YAML: `logging:
+  level: info
+  file: mcp-linux-over-ssh.log
 ssh:
   command: "ssh -tt psmuser@bastion.example.com"
   prompt_regex: '(?m)^[^\n]*[$#]\s*$'
@@ -42,8 +51,9 @@ ssh:
 			Name:        "One parameter — the caller picks the host",
 			Description: "start_session takes {\"host\": \"...\"}.",
 			Params:      1,
-			YAML: `server:
-  mode: stdio
+			YAML: `logging:
+  level: info
+  file: mcp-linux-over-ssh.log
 ssh:
   command: "ssh -tt psmuser@{{.host}}"
   prompt_regex: '(?m)^[^\n]*[$#]\s*$'
@@ -56,8 +66,9 @@ ssh:
 			Name:        "Two parameters — the caller picks the account and the host",
 			Description: "start_session takes {\"user\": \"...\", \"host\": \"...\"}. prompt_regex is\ntemplated too, so it can match that user's own prompt exactly.",
 			Params:      2,
-			YAML: `server:
-  mode: stdio
+			YAML: `logging:
+  level: info
+  file: mcp-linux-over-ssh.log
 ssh:
   command: "ssh -tt {{.user}}@{{.host}}"
   prompt_regex: '(?m)^\[{{.user}}@[^\]]+\][$#]\s*$'
@@ -82,6 +93,8 @@ func HelpConfig() string {
 	b.WriteString("Nothing connects when this server starts. The ssh: block is a template for the\n")
 	b.WriteString("sessions an MCP client opens on demand with the start_session tool, and\n")
 	b.WriteString("ssh.parameters decides what that tool takes as arguments.\n\n")
+	b.WriteString("server.mode is omitted below: it defaults to stdio, which is the only mode\n")
+	b.WriteString("this server supports.\n\n")
 
 	for i, ex := range Examples() {
 		heading := fmt.Sprintf("%d. %s", i+1, ex.Name)
@@ -101,11 +114,22 @@ func HelpConfig() string {
 	b.WriteString("  inside quotes of your own, since it supplies its own.\n\n")
 	b.WriteString("  Every {{.name}} used in command or prompt_regex must be declared in\n")
 	b.WriteString("  parameters, and that is checked at startup, not on the first start_session.\n\n")
+	b.WriteString("  logging.file earns its place in every example above. stdout carries the\n")
+	b.WriteString("  JSON-RPC stream and nothing else may touch it, and an MCP client usually\n")
+	b.WriteString("  swallows stderr, so without a file there is nowhere to read what went wrong\n")
+	b.WriteString("  when a session will not log in. A relative path resolves against the\n")
+	b.WriteString("  server's working directory, which the client chooses; use an absolute path\n")
+	b.WriteString("  if you are not sure what that will be.\n\n")
 	fmt.Fprintf(&b, "  Other keys worth knowing: login_timeout (%s), command_timeout (%s),\n",
 		DefaultLoginTimeout, DefaultCommandTimeout)
 	fmt.Fprintf(&b, "  max_sessions (%d), idle_timeout (0 = never reap), require_confirmation,\n", DefaultMaxSessions)
 	b.WriteString("  and init_commands. Durations need a unit: 30m, not 30.\n\n")
-	b.WriteString("  See config.yaml.example for the fully commented set.\n")
+	b.WriteString("  The fully commented reference configuration, documenting every option and\n")
+	b.WriteString("  its default, is at:\n\n")
+	// Indented less than the code sample above so the line stays under the wrap column: a
+	// URL broken across two lines cannot be clicked or copied, which defeats the point of
+	// printing it.
+	b.WriteString("  " + ExampleConfigURL + "\n")
 
 	return b.String()
 }

@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The examples --help-config prints are documentation that ships with the binary, so they
@@ -24,8 +25,20 @@ func TestExamplesAllLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("example does not load: %v", err)
 			}
+			// The examples deliberately omit server.mode. This asserts the library's
+			// default still lands on stdio, which is what makes that omission safe —
+			// if it ever changed, every example would silently describe an HTTP server.
 			if cfg.Lib.Server.Mode != "stdio" {
-				t.Errorf("mode = %q, want stdio", cfg.Lib.Server.Mode)
+				t.Errorf("mode = %q, want stdio to be the default for an omitted server: block", cfg.Lib.Server.Mode)
+			}
+			// Logging to a file is shown in every example on purpose: stdout is the
+			// JSON-RPC stream and clients tend to swallow stderr, so this is the only
+			// place an operator can read a failed login.
+			if cfg.Logging.File == "" {
+				t.Error("example does not set logging.file")
+			}
+			if cfg.Lib.Logging.Level != "info" {
+				t.Errorf("logging.level = %q, want info", cfg.Lib.Logging.Level)
 			}
 
 			params := cfg.Renderer.Parameters()
@@ -95,5 +108,38 @@ func TestHelpConfigMentionsEveryExample(t *testing.T) {
 	}
 	if !strings.Contains(out, "shquote") {
 		t.Error("--help-config output does not mention shquote")
+	}
+}
+
+// This is terminal output, so it has to fit a terminal. Measured in runes rather than
+// bytes: the headings carry em-dashes, which cost three bytes and one column. Broken twice
+// during development — once by underlining a heading with a byte count, once by a URL that
+// overflowed — hence a test rather than an eyeball.
+func TestHelpConfigFitsEightyColumns(t *testing.T) {
+	for i, line := range strings.Split(HelpConfig(), "\n") {
+		if n := utf8.RuneCountInString(line); n > 80 {
+			t.Errorf("line %d is %d columns, want <= 80:\n%s", i+1, n, line)
+		}
+	}
+}
+
+// Anything this output points at has to be reachable by someone who has never seen the
+// repository — a `go install`'d binary or a container image is the common case, and a bare
+// "config.yaml.example" is unresolvable from either. This guards against quietly sliding
+// back to a filename.
+func TestHelpConfigPointsAtAResolvableReference(t *testing.T) {
+	out := HelpConfig()
+
+	if !strings.HasPrefix(ExampleConfigURL, "https://") {
+		t.Errorf("ExampleConfigURL = %q, want a full URL", ExampleConfigURL)
+	}
+	if !strings.Contains(out, ExampleConfigURL) {
+		t.Errorf("--help-config output does not contain %q", ExampleConfigURL)
+	}
+
+	// The filename may only appear as part of the URL, never standing on its own.
+	const bare = "config.yaml.example"
+	if strings.Count(out, bare) != strings.Count(out, ExampleConfigURL) {
+		t.Errorf("--help-config mentions %q outside of the full URL; a reader with no checkout cannot resolve that", bare)
 	}
 }
