@@ -45,3 +45,19 @@ time.Duration`. It looked obviously correct and was obviously broken.
 
 **Apply as:** any config example the project ships is code. Run the binary against it (with
 the target-specific fields substituted) as part of verification, rather than eyeballing it.
+
+## A library's documented pattern is a claim to verify, not a spec (2026-08-21)
+
+generic-go-mcp v0.8.0 added `StdioTransport.Done()` for stdio shutdown, and the README, the
+consumption skill, the migration guide and the project harness template all spell it
+`select { case <-sigCh: case <-trans.Done(): }`. Adopting it here would have hung the server
+forever on any shutdown with a live subscriber: `Done()` closes only after `serve` finishes
+`wg.Wait()`, and a `subscriptions/listen` handler returns only on context cancel, which only
+`Stop` does — so the very signal meant to trigger `Stop` waits on `Stop`. Four documents
+agreeing did not make it right for a server that has long-lived handlers.
+
+**Apply as:** before replacing working code with a library's blessed pattern, check the
+pattern against *this* codebase's concurrency, and prove it with a throwaway program rather
+than reasoning about it. The check cost about five minutes; shipping it would have been a
+hang in production with privileged sessions held open. Also: adopting part of a new API is a
+legitimate outcome — `Done()` was still worth using after `Stop()`, just not as the trigger.

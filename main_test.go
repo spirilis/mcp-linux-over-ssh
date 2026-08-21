@@ -1,9 +1,12 @@
 package main
 
 import (
+	"io"
+	"os"
 	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spirilis/generic-go-mcp/mcp"
 
@@ -181,5 +184,64 @@ func TestReleaseVersionAcceptsOnlyCleanTags(t *testing.T) {
 		if got := releaseVersion(in); got != want {
 			t.Errorf("releaseVersion(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestWatchStdinReportsEOFWithoutTouchingTheGlobal pins the two halves of watchStdin's
+// contract that the rest of the shutdown path rests on: the returned reader carries stdin's
+// bytes through unchanged, and the channel closes when the real stdin reaches EOF.
+//
+// The os.Stdin assertion is the part worth keeping. The transport used to be handed the pipe
+// by reassigning the global before constructing it, which made the seam invisible at the call
+// site and load-bearing on ordering; NewStdioTransportWithStreams took the argument instead,
+// and nothing should quietly go back.
+func TestWatchStdinReportsEOFWithoutTouchingTheGlobal(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	realStdin := os.Stdin
+	os.Stdin = pr
+	defer func() { os.Stdin = realStdin }()
+
+	stream, closed := watchStdin()
+
+	if os.Stdin != pr {
+		t.Error("watchStdin reassigned os.Stdin; the transport is handed the stream explicitly now")
+	}
+
+	select {
+	case <-closed:
+		t.Fatal("the EOF channel closed while stdin was still open")
+	default:
+	}
+
+	const line = "{\"jsonrpc\":\"2.0\"}\n"
+	if _, err := io.WriteString(pw, line); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got := make([]byte, len(line))
+	if _, err := io.ReadFull(stream, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != line {
+		t.Errorf("stream delivered %q, want %q", got, line)
+	}
+
+	pw.Close()
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the EOF channel never closed after stdin was closed")
+	}
+
+	// The write end is closed with the real stdin, so the transport's own read loop ends too
+	// rather than parking on a pipe nothing will ever write to again.
+	if _, err := io.ReadAll(stream); err != nil {
+		t.Errorf("reading the stream after EOF: %v", err)
 	}
 }

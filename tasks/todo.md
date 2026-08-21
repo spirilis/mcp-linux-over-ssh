@@ -490,3 +490,44 @@ the resulting binary what it is.
 - Confirmed empirically that `go install github.com/spirilis/mcp-linux-over-ssh@latest`
   resolves to `v0.3.0` — and that the resulting binary rejects `--version`, which is exactly
   the gap this closes.
+
+## Upgrade to generic-go-mcp v0.8.1 (2026-08-21)
+
+The library moved v0.5.0 → v0.8.1 (adding resource templates, `completion/complete`, the
+skills extension, `resources/directory/read`, and stdio lifecycle methods). Goal: true this
+server up against it and decide what, if anything, is worth adopting.
+
+- [x] **The upgrade itself is drop-in.** `go get` to v0.8.1, then `go build`, `go vet` and the
+      full `-race` suite all pass with zero source changes. Nothing this server touches
+      changed shape; every new capability is opt-in and nil unless configured.
+- [x] **Confirmed the advertised capabilities did not move** — still exactly
+      `[resources, tools]` on both the legacy `initialize` diagnostic and `server/discover`.
+      This is the one thing an upgrade here must not change silently, since a
+      pre-2026-07-28 client caches it from its handshake and never looks again.
+- [x] **Adopted `NewStdioTransportWithStreams`.** `watchStdin` now returns the pipe's read end
+      and the transport is handed it as an argument, instead of the seam being smuggled in by
+      assigning `os.Stdin = pr` before `NewStdioTransport` captured the global. Removes a
+      global mutation and an ordering trap.
+- [x] **Did *not* adopt `<-trans.Done()` as the stdin-EOF signal, which is what the library's
+      own documentation tells you to do.** It deadlocks here — see the lesson below.
+- [x] **Adopted `Done()` in the one role it can serve:** after `Stop()`, bounded by a new
+      `stopGrace`, so the read loop and every handler have actually unwound before
+      `mgr.CloseAll()` runs and "shutdown complete" claims it.
+- [x] **Evaluated and declined** resource templates, `completion/complete`,
+      `resources/directory/read`, the skills extension, and
+      `ResourceContentResult.Meta`/`Annotations`. Reasoning recorded in CLAUDE.md under
+      "The v0.8.1 surface this server deliberately does not use", so it is not re-derived.
+
+#### Verification
+
+- `go build`, `go vet`, `gofmt -l`, and `go test ./... -race` all clean.
+- Reproduced the `Done()` deadlock in a standalone program against v0.8.1 before designing
+  around it: EOF with no subscriber closes `Done()`; EOF with one parked
+  `subscriptions/listen` never does.
+- End-to-end against a real `bash -i` config: `tools/list` answers and the process exits in
+  ~0.3s; the same run with a parked `subscriptions/listen` also exits in ~0.3s with status 0,
+  which is the case the naive adoption would have hung on.
+- Probed the newly-routed methods: `resources/templates/list` returns an empty list,
+  `completion/complete` and `skills/list` return `-32601`.
+- `TestWatchStdinReportsEOFWithoutTouchingTheGlobal` added and mutation-checked by
+  reintroducing `os.Stdin = pr` (it fails).

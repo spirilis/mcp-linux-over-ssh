@@ -233,14 +233,13 @@ func main() {
 	}
 	handler := &drainingHandler{inner: handlerInner}
 
-	// Interpose a pipe on stdin before the transport claims it, so this process can see
-	// the client close it. Closing stdin is the spec's shutdown signal for a stdio server,
-	// but the transport reads os.Stdin directly and its Stop cannot interrupt a blocked
-	// read (transport/stdio.go says as much), so without this the server outlives its
-	// client — a `docker run -i` would sit there forever holding its SSH sessions open.
-	stdinClosed := watchStdin()
+	// Interpose a pipe on stdin so this process can see the client close it, and hand the
+	// transport the read end explicitly. Closing stdin is the spec's shutdown signal for a
+	// stdio server; without noticing it the server outlives its client — a `docker run -i`
+	// would sit there forever holding its sessions open.
+	stdin, stdinClosed := watchStdin()
 
-	trans := transport.NewStdioTransport()
+	trans := transport.NewStdioTransportWithStreams(stdin, os.Stdout)
 	if err := trans.Start(handler); err != nil {
 		logging.Error("error starting transport", "error", err)
 		// os.Exit skips the deferred CloseAll. Nothing can be open this early — sessions
@@ -275,6 +274,17 @@ func main() {
 	if err := trans.Stop(); err != nil {
 		logging.Error("error stopping transport", "error", err)
 	}
+	// Stop cancels in-flight contexts and returns without waiting, since it cannot interrupt
+	// a blocked read. Done closes once the read loop has actually unwound, and every handler
+	// with it — including the subscriptions/listen streams Stop just cancelled, which are the
+	// ones waitIdle deliberately does not count. Waiting here is what keeps CloseAll from
+	// racing a handler that still holds a session. Bounded, because a handler that ignores
+	// its context must not be able to hold the process open.
+	select {
+	case <-trans.Done():
+	case <-time.After(stopGrace):
+		logging.Warn("transport did not finish unwinding within the stop grace period")
+	}
 	// Closed here rather than left to the defer at the top so the SSH sessions are
 	// actually gone before "shutdown complete" claims it. The defer stays for the paths
 	// this line cannot cover, a panic above it chief among them; a session announces its
@@ -292,6 +302,9 @@ const (
 	// drainGrace caps the wait, so a command still running when the client vanishes
 	// cannot hold the process open indefinitely.
 	drainGrace = 10 * time.Second
+	// stopGrace caps the wait for the transport's read loop to unwind after Stop. The work
+	// itself has already drained by then; this covers only the unwinding, so it is short.
+	stopGrace = 2 * time.Second
 )
 
 // drainingHandler counts in-flight requests so shutdown can wait for them.
@@ -349,25 +362,34 @@ func (d *drainingHandler) waitIdle(quiet, grace time.Duration) {
 	logging.Warn("requests still in flight when the drain grace period expired")
 }
 
-// watchStdin replaces os.Stdin with the read end of a pipe fed from the real stdin, and
-// returns a channel closed when the real stdin reaches EOF.
+// watchStdin returns the stream the transport should serve, plus a channel closed when the
+// real stdin reaches EOF. The pipe is transparent: the transport sees the same bytes in the
+// same order, and the write end is closed on EOF so its own read loop terminates too. If the
+// pipe cannot be created the server falls back to serving stdin directly and shutting down
+// on a signal alone, rather than refusing to start.
 //
-// The transport reads os.Stdin directly, so this is the seam that lets the server notice
-// its client going away. The pipe is transparent to the transport: it sees the same bytes
-// in the same order, and the pipe's write end is closed on EOF so the transport's own read
-// loop terminates too. If the pipe cannot be created the server simply falls back to
-// signal-only shutdown rather than refusing to start.
-func watchStdin() <-chan struct{} {
+// The library offers StdioTransport.Done for this, and it is deliberately not used here.
+// Done closes only once the read loop has exited *and* every in-flight handler has returned
+// (transport/stream.go waits on its WaitGroup), while a subscriptions/listen handler returns
+// only when the transport's context is cancelled — which nothing but Stop does. A client that
+// subscribes and then closes stdin would therefore never trip Done, and this server invites
+// exactly that: every session publishes a status resource whose updates are worth watching.
+// Verified against v0.8.1; the deadlock is real, not theoretical. Keeping the EOF signal
+// separate from the drain is what makes stdin EOF prompt regardless of what is parked.
+//
+// What the upgrade did buy is NewStdioTransportWithStreams: the read end is now passed to the
+// transport as an argument instead of being smuggled in by reassigning the os.Stdin global
+// before construction, so the seam is visible at the call site and carries no ordering trap.
+func watchStdin() (io.Reader, <-chan struct{}) {
 	done := make(chan struct{})
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		logging.Warn("could not watch stdin for EOF; shutdown will require a signal", "error", err)
-		return done // never closed
+		return os.Stdin, done // never closed
 	}
 
 	real := os.Stdin
-	os.Stdin = pr
 
 	go func() {
 		defer close(done)
@@ -375,7 +397,7 @@ func watchStdin() <-chan struct{} {
 		_ = pw.Close()
 	}()
 
-	return done
+	return pr, done
 }
 
 // registerSessionsIndex publishes the collection of open sessions.

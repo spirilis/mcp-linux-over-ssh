@@ -8,6 +8,8 @@ github.com/spirilis/generic-go-mcp v0.4.0 h1:76HKL1AqSbbmXC0nBXj3jZQBPSCswy60EYE
 github.com/spirilis/generic-go-mcp v0.4.0/go.mod h1:0XPd/BG0JSiMdaMchWGk0lgHsNg6842+vZUjfTLhtCE=
 github.com/spirilis/generic-go-mcp v0.5.0 h1:MbEA3NruQjx728G/MSRHGfGeEx+17EyP0SwFcLBafyQ=
 github.com/spirilis/generic-go-mcp v0.5.0/go.mod h1:0XPd/BG0JSiMdaMchWGk0lgHsNg6842+vZUjfTLhtCE=
+github.com/spirilis/generic-go-mcp v0.8.1 h1:G11D7DpZ230j4C5XhoMKAo2+m77zrt9IrCnYu22zKsE=
+github.com/spirilis/generic-go-mcp v0.8.1/go.mod h1:0XPd/BG0JSiMdaMchWGk0lgHsNg6842+vZUjfTLhtCE=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
