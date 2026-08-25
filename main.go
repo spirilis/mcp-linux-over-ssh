@@ -35,7 +35,7 @@ import (
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.3.1"
+	serverVersion = "0.4.0"
 
 	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
 	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
