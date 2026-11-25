@@ -1,15 +1,26 @@
 # mcp-linux-over-ssh configuration.
 #
 # This one file feeds two parsers: generic-go-mcp reads server: and logging:, and this
-# server reads ssh:.
+# server reads ssh:, plus actor_jwt: and tls: when server.mode is http (see the end).
 #
 # Nothing connects when this server starts. The ssh: block below is a template for the
 # sessions an MCP client opens on demand with the start_session tool; several can be live
 # at once, each an independent SSH login.
 
 server:
-  # stdio is the only mode this server supports.
+  # stdio: launched by an MCP client, which is the only caller. The default.
+  # http:  a network service for kagent agents. Never anonymous — it requires the
+  #        actor_jwt: block at the end of this file and will not start without it — and
+  #        requires ssh.idle_timeout below.
   mode: stdio
+
+  # http mode only. Defaults shown.
+  # http:
+  #   host: 0.0.0.0
+  #   port: 8080
+  #   # Browser Origins allowed to call /mcp. Requests with no Origin header (agents, curl)
+  #   # are always allowed; empty permits localhost origins only.
+  #   allowed_origins: []
 
   # Optional. Also accept MCP clients still on a connection-scoped protocol revision
   # (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05) alongside this server's native
@@ -95,6 +106,10 @@ ssh:
   # stdio server's sessions are already bounded by the life of its client. A session
   # running a command, or still logging in, is never reaped regardless.
   #
+  # REQUIRED with server.mode: http. Nothing bounds a session there: a caller that walks
+  # away leaves a privileged login open, and since a session belongs to the caller that
+  # opened it, nobody else can end it. Unreaped, they fill max_sessions.
+  #
   # Like every duration here it must be written as a string with a unit — 30m, not 30.
   # idle_timeout: 30m
 
@@ -175,3 +190,45 @@ ssh:
   # run_bash at all; true otherwise, unchanged from before compat existed. Set explicitly,
   # as below, to pin it either way regardless of compat mode.
   require_confirmation: true
+
+# ---------------------------------------------------------------------------------------
+# Everything below applies to server.mode: http only, and is rejected in stdio mode.
+# ---------------------------------------------------------------------------------------
+
+# Who may call. The HTTP transport accepts exactly one credential: the Substrate actor JWT
+# that kagent's egress gateway attaches for a RemoteMCPServer with spec.actorJwt. There is
+# no anonymous access, no static token and no OAuth; an `auth:` block is a startup error
+# rather than something silently ignored.
+#
+# A token is verified against this cluster's issuer, resolved to the kagent Agent it
+# belongs to, and that Agent is checked against allowed_agents. Sessions then belong to the
+# Agent *and* the conversation that opened them: one caller cannot list, use, read or end
+# another's.
+# actor_jwt:
+#   enabled: true
+#   # This cluster's Substrate issuer. Default shown.
+#   issuer: https://idp.ate-system.svc
+#   # Must equal an entry of the RemoteMCPServer's spec.actorJwt.audiences. Required.
+#   audience: http://mcp-linux-over-ssh.kagent.svc.cluster.local
+#   # The CA bundle the issuer's own TLS certificate must chain to: the cluster's
+#   # servicedns signer, normally a projected ClusterTrustBundle. Required, and the only
+#   # roots consulted — the system trust store is never used for the issuer.
+#   ca_file: /etc/mcp-linux-over-ssh/issuer-ca/ca.pem
+#   # "namespace/name" of each Agent allowed in. Either half may be a glob that does not
+#   # cross the slash: "research/*", "team-*/reporter". Prefer exact names — a namespace
+#   # glob admits anyone who can create an Agent there. Empty refuses every agent.
+#   allowed_agents:
+#     - kagent/my-agent
+#   # The local kagent controller, which says which Agent a token belongs to. Defaults shown.
+#   kagent_controller:
+#     address: kagent-controller.kagent:8083
+#     tls: false
+#     # ca_file: /etc/mcp-linux-over-ssh/kagent-ca/ca.pem
+
+# Serve HTTPS from this process instead of plain HTTP. Both files are re-read when they
+# change, so a renewed certificate needs no restart. Where they come from is up to you: a
+# cert-manager Secret, a CSI driver, a SPIFFE helper writing an X.509 SVID to disk.
+# tls:
+#   enabled: true
+#   cert_file: /etc/mcp-linux-over-ssh/tls/tls.crt
+#   key_file: /etc/mcp-linux-over-ssh/tls/tls.key

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,7 +23,7 @@ import (
 //
 // base carries every session setting that is not per-connection (timeouts, PTY geometry,
 // init commands); only Command and PromptRegex are rendered per session.
-func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Config) (mcp.Tool, mcp.ToolFunction) {
+func NewStartSession(mgr *session.Manager, owner OwnerFunc, r *config.Renderer, base session.Config) (mcp.Tool, mcp.ToolFunction) {
 	params := r.Parameters()
 
 	return startSessionDefinition(params, mgr.Max(), mgr.Gated()), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
@@ -32,6 +33,11 @@ func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Conf
 		// open is wasted work. Manager.Start checks again and is the actual enforcement
 		// point; this is here for the message, which needs to tell a model to stop.
 		if err := mgr.Blocked(); err != nil {
+			return mcp.ErrorResultf("cannot start a session: %v", err), nil
+		}
+
+		who, err := owner(ctx)
+		if err != nil {
 			return mcp.ErrorResultf("cannot start a session: %v", err), nil
 		}
 
@@ -48,15 +54,21 @@ func NewStartSession(mgr *session.Manager, r *config.Renderer, base session.Conf
 		cfg := base
 		cfg.Command, cfg.PromptRegex = command, promptRegex
 
-		id, err := mgr.Start(cfg, values)
+		id, err := mgr.Start(who, cfg, values)
 		if err != nil {
+			if errors.Is(err, session.ErrSessionLimit) && len(mgr.List(who)) < mgr.Live() {
+				// The cap is the server's, not the caller's, and list_sessions shows a
+				// caller only its own. Without this a caller holding none of the sessions
+				// in the way is told to end one and can find nothing to end.
+				return mcp.ErrorResultf("%v. Some of those sessions were opened by other callers of this server and are not yours to end; they are closed when their own callers finish or when they go idle, so try again later", err), nil
+			}
 			return mcp.ErrorResultf("%v", err), nil
 		}
 
 		// Reported rather than waited for. The login handshake runs in the background,
 		// so this is very often "starting"; see Manager.Start for why blocking on a
 		// bastion login is the wrong trade.
-		sess, ok := mgr.Get(id)
+		sess, ok := mgr.Get(who, id)
 		state := session.StateStarting.String()
 		if ok {
 			state = sess.Status().State

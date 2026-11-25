@@ -1,0 +1,35 @@
+{{- /*
+Plain-HTTP -> HTTPS redirect. Attaches to the same Gateways as the main route,
+but on the httpRedirect.sectionName listener. The parentRefs are copies (omit
+returns a new dict), so the main route's values are never modified. Any `port`
+is dropped too, since it would name the HTTPS port.
+*/ -}}
+{{- if and .Values.gateway.enabled .Values.gateway.httpRedirect.enabled }}
+{{- $parentRefs := list }}
+{{- range .Values.gateway.parentRefs }}
+{{- $ref := omit . "sectionName" "port" }}
+{{- $_ := set $ref "sectionName" $.Values.gateway.httpRedirect.sectionName }}
+{{- $parentRefs = append $parentRefs $ref }}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}-redirect
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+  {{- with .Values.gateway.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- toYaml $parentRefs | nindent 4 }}
+  hostnames:
+    - {{ .Values.host | quote }}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+{{- end }}

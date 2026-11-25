@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: {{ include "mcp-linux-over-ssh.scheme" . }}
+      port: {{ include "mcp-linux-over-ssh.servicePort" . }}
+      targetPort: {{ include "mcp-linux-over-ssh.scheme" . }}
+      protocol: TCP
+      {{- if and .Values.service.nodePort (has .Values.service.type (list "NodePort" "LoadBalancer")) }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "mcp-linux-over-ssh.selectorLabels" . | nindent 4 }}

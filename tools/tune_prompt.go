@@ -30,7 +30,7 @@ type TunePromptArguments struct {
 // The regex is a property of one running session, not of the process: ssh.prompt_regex is
 // itself a template, so two sessions opened against different hosts can legitimately need
 // different patterns, and repairing one must not disturb the other.
-func NewTunePromptRegex(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
+func NewTunePromptRegex(mgr *session.Manager, owner OwnerFunc) (mcp.Tool, mcp.ToolFunction) {
 	return tunePromptDefinition(), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		var args TunePromptArguments
 		if err := req.BindArguments(&args); err != nil {
@@ -40,7 +40,7 @@ func NewTunePromptRegex(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
 			return mcp.ErrorResultf("regex argument is required"), nil
 		}
 
-		sess, err := resolveSession(mgr, strings.TrimSpace(args.SessionID))
+		sess, err := resolveSession(ctx, mgr, owner, strings.TrimSpace(args.SessionID))
 		if err != nil {
 			return mcp.ErrorResultf("%v", err), nil
 		}

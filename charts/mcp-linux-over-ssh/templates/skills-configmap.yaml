@@ -1,0 +1,16 @@
+{{- /*
+The skills written in values. One key per skill, holding its generated SKILL.md;
+the Deployment mounts each key as <name>/SKILL.md.
+*/ -}}
+{{- if .Values.skills.inject }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-linux-over-ssh.skillsConfigMapName" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+data:
+  {{- range .Values.skills.inject }}
+  {{ .name }}: {{ include "mcp-linux-over-ssh.skillMd" . | toJson }}
+  {{- end }}
+{{- end }}

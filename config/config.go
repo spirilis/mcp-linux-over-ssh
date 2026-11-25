@@ -1,8 +1,9 @@
 // Package config loads mcp-linux-over-ssh's configuration.
 //
 // The same YAML file feeds two parsers: generic-go-mcp's own config.Load reads the
-// server: and logging: blocks, and this package reads the ssh: block, plus a couple of
-// fields the library's logging: block doesn't have room for (see LoggingConfig). The
+// server: and logging: blocks, and this package reads the ssh: block, the actor_jwt: and
+// tls: blocks that only matter in http mode (see http.go), plus a couple of fields the
+// library's logging: block doesn't have room for (see LoggingConfig). The
 // library's config.Config has no extension point, so a second unmarshal of the same file
 // is the least surprising way to carry our own settings.
 package config
@@ -49,7 +50,9 @@ type SSHConfig struct {
 	// IdleTimeout closes sessions that have gone this long without running a command.
 	// Zero (the default) never reaps: on a PAM/PSM bastion, tearing down a privileged
 	// session someone is still reasoning about is worse than keeping it, and a stdio
-	// server's sessions are already bounded by the life of its client.
+	// server's sessions are already bounded by the life of its client. That argument does
+	// not survive server.mode: http, where no client lifetime bounds anything — there a
+	// positive value is required (see validateTransport).
 	IdleTimeout time.Duration `yaml:"idle_timeout"`
 
 	// DisableFlagFile is an administrative kill switch: while a file exists at this path,
@@ -115,6 +118,12 @@ type Config struct {
 	SSH     SSHConfig
 	Logging LoggingConfig
 
+	// ActorJWT admits kagent agents by their Substrate actor JWT. Required in http mode,
+	// rejected in stdio mode.
+	ActorJWT *ActorJWTConfig
+	// TLS makes the HTTP listener serve HTTPS itself. http mode only.
+	TLS *TLSConfig
+
 	// Renderer turns start_session's arguments into one session's command and prompt
 	// regex. Built by Load so a template that references an undeclared parameter is a
 	// startup failure rather than a first-call one.
@@ -122,8 +131,10 @@ type Config struct {
 }
 
 type fileEnvelope struct {
-	SSH     SSHConfig     `yaml:"ssh"`
-	Logging LoggingConfig `yaml:"logging"`
+	SSH      SSHConfig       `yaml:"ssh"`
+	Logging  LoggingConfig   `yaml:"logging"`
+	ActorJWT *ActorJWTConfig `yaml:"actor_jwt"`
+	TLS      *TLSConfig      `yaml:"tls"`
 }
 
 // Defaults applied to any field the file leaves unset.
@@ -180,8 +191,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse ssh config: %w", err)
 	}
 
-	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging}
+	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging, ActorJWT: env.ActorJWT, TLS: env.TLS}
 	if err := cfg.SSH.applyDefaults(); err != nil {
+		return nil, err
+	}
+	if err := cfg.validateTransport(); err != nil {
 		return nil, err
 	}
 	if cfg.Renderer, err = NewRenderer(cfg.SSH); err != nil {

@@ -132,11 +132,11 @@ func allToolDefinitions(t *testing.T) []toolCase {
 		add := func(tool mcp.Tool, _ mcp.ToolFunction) {
 			out = append(out, toolCase{name: m.label + "/" + tool.Name, tool: tool, gated: m.on})
 		}
-		add(NewStartSession(m.mgr, renderer, session.Config{}))
-		add(NewListSessions(m.mgr))
-		add(NewEndSession(m.mgr))
-		add(NewRunBash(m.mgr, true))
-		add(NewTunePromptRegex(m.mgr))
+		add(NewStartSession(m.mgr, SingleCaller, renderer, session.Config{}))
+		add(NewListSessions(m.mgr, SingleCaller))
+		add(NewEndSession(m.mgr, SingleCaller))
+		add(NewRunBash(m.mgr, SingleCaller, true))
+		add(NewTunePromptRegex(m.mgr, SingleCaller))
 		if m.on {
 			add(NewIsDisabledByFlag(m.mgr))
 		}

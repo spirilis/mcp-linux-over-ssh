@@ -19,9 +19,14 @@ import (
 // A model whose context no longer holds that reply would otherwise have no way back to a
 // session it is still paying for. This is that way back, and it is also the readiness check
 // start_session points at.
-func NewListSessions(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
+func NewListSessions(mgr *session.Manager, owner OwnerFunc) (mcp.Tool, mcp.ToolFunction) {
 	return listSessionsDefinition(), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
-		infos := mgr.List()
+		who, err := owner(ctx)
+		if err != nil {
+			return mcp.ErrorResultf("%v", err), nil
+		}
+		// Only this caller's sessions. On a transport with one caller that is all of them.
+		infos := mgr.List(who)
 		// Deliberately not refused when the server is disabled — looking is always allowed.
 		// This is where a model comes to work out why its sessions evaporated, and answering
 		// "you may not look" would leave it with the disappearance and no cause.

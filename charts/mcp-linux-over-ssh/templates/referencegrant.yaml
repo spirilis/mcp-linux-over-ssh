@@ -1,0 +1,39 @@
+{{- /*
+Gateway listeners may only reference TLS Secrets in their own namespace unless
+a ReferenceGrant in the Secret's namespace allows it. This grants Gateways in
+the configured (or parentRef) namespaces access to the cert-manager Secret.
+Kept at v1beta1: clusters on Gateway API v1.3.x serve ReferenceGrant only as
+v1beta1.
+*/ -}}
+{{- if and .Values.gateway.enabled .Values.gateway.referenceGrant.enabled }}
+{{- $namespaces := .Values.gateway.referenceGrant.namespaces }}
+{{- if not $namespaces }}
+  {{- $namespaces = list }}
+  {{- range .Values.gateway.parentRefs }}
+    {{- if .namespace }}
+      {{- $namespaces = append $namespaces .namespace }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- $namespaces = $namespaces | uniq }}
+{{- if not $namespaces }}
+{{- fail "gateway.referenceGrant.enabled requires gateway.referenceGrant.namespaces or namespaced gateway.parentRefs" }}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}-tls
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+spec:
+  from:
+    {{- range $namespaces }}
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: {{ . | quote }}
+    {{- end }}
+  to:
+    - group: ""
+      kind: Secret
+      name: {{ include "mcp-linux-over-ssh.gatewayTLSSecretName" $ }}
+{{- end }}

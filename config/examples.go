@@ -93,8 +93,9 @@ func HelpConfig() string {
 	b.WriteString("Nothing connects when this server starts. The ssh: block is a template for the\n")
 	b.WriteString("sessions an MCP client opens on demand with the start_session tool, and\n")
 	b.WriteString("ssh.parameters decides what that tool takes as arguments.\n\n")
-	b.WriteString("server.mode is omitted below: it defaults to stdio, which is the only mode\n")
-	b.WriteString("this server supports.\n\n")
+	b.WriteString("server.mode is omitted below: it defaults to stdio, where the MCP client that\n")
+	b.WriteString("launched this process is the only caller. The other mode, http, is described\n")
+	b.WriteString("in the notes.\n\n")
 
 	for i, ex := range Examples() {
 		heading := fmt.Sprintf("%d. %s", i+1, ex.Name)
@@ -126,6 +127,15 @@ func HelpConfig() string {
 	b.WriteString("  as they stop running whatever they are running. Removing the file resumes\n")
 	b.WriteString("  service with no restart. Only the file's existence matters — its contents\n")
 	b.WriteString("  are never read — so touch and rm are the whole interface.\n\n")
+	b.WriteString("  server.mode: http serves kagent agents over the network instead, and is\n")
+	b.WriteString("  never anonymous: it requires an actor_jwt: block (audience, ca_file,\n")
+	b.WriteString("  allowed_agents) and refuses to start without one. It also requires\n")
+	b.WriteString("  ssh.idle_timeout, since no client lifetime ends an abandoned session there.\n")
+	b.WriteString("  An optional tls: block (cert_file, key_file) makes the listener serve HTTPS\n")
+	b.WriteString("  itself. Each caller sees and uses only the sessions it opened.\n\n")
+	b.WriteString("  --skills <dir> (repeatable, any mode) serves Agent Skills to clients that\n")
+	b.WriteString("  load them: a directory holding a SKILL.md, or one whose subdirectories each\n")
+	b.WriteString("  hold one. It is read once, at startup.\n\n")
 	fmt.Fprintf(&b, "  Other keys worth knowing: login_timeout (%s), command_timeout (%s),\n",
 		DefaultLoginTimeout, DefaultCommandTimeout)
 	fmt.Fprintf(&b, "  max_sessions (%d), idle_timeout (0 = never reap), require_confirmation,\n", DefaultMaxSessions)

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: mcp-linux-over-ssh
+description: >-
+  MCP server that runs commands on remote hosts through persistent shell
+  sessions, served over Streamable HTTP to kagent agents authenticated by
+  their Substrate actor JWT. Service plus optional Gateway API exposure,
+  optional TLS on the pod itself or at the Gateway via cert-manager, and
+  Agent Skills served from ConfigMaps or straight from values.
+type: application
+version: 0.1.0
+appVersion: "0.5.0"

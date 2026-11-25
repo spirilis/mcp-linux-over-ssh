@@ -38,7 +38,7 @@ var confirmSchema = json.RawMessage(`{
 // nothing executes until the caller retries with an accepted confirmation of that exact
 // command. Clients that have not declared the elicitation capability cannot use the tool at
 // all in that mode.
-func NewRunBash(mgr *session.Manager, requireConfirmation bool) (mcp.Tool, mcp.ToolFunction) {
+func NewRunBash(mgr *session.Manager, owner OwnerFunc, requireConfirmation bool) (mcp.Tool, mcp.ToolFunction) {
 	return runBashDefinition(requireConfirmation, mgr.Gated()), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		// Ahead of everything, including the confirmation round trip: there is no point
 		// asking a user to approve a command the server has already been told not to run,
@@ -58,7 +58,7 @@ func NewRunBash(mgr *session.Manager, requireConfirmation bool) (mcp.Tool, mcp.T
 			return mcp.ErrorResultf("cmd argument is required"), nil
 		}
 
-		sess, err := resolveSession(mgr, strings.TrimSpace(args.SessionID))
+		sess, err := resolveSession(ctx, mgr, owner, strings.TrimSpace(args.SessionID))
 		if err != nil {
 			return mcp.ErrorResultf("%v", err), nil
 		}

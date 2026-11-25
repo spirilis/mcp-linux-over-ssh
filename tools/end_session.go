@@ -21,7 +21,7 @@ type EndSessionArguments struct {
 // Ending is not optional housekeeping here: every session is a privileged login the far end
 // is auditing, and they are capped. A command still running on the session is cancelled
 // rather than waited for — see Manager.End.
-func NewEndSession(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
+func NewEndSession(mgr *session.Manager, owner OwnerFunc) (mcp.Tool, mcp.ToolFunction) {
 	return endSessionDefinition(), func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
 		var args EndSessionArguments
 		if err := req.BindArguments(&args); err != nil {
@@ -32,13 +32,18 @@ func NewEndSession(mgr *session.Manager) (mcp.Tool, mcp.ToolFunction) {
 			return mcp.ErrorResultf("session_id is required; call list_sessions to see which sessions are open"), nil
 		}
 
-		if !mgr.End(id) {
+		who, err := owner(ctx)
+		if err != nil {
+			return mcp.ErrorResultf("%v", err), nil
+		}
+
+		if !mgr.End(who, id) {
 			// Already gone is the outcome the caller wanted, but saying so plainly beats
 			// reporting success for an id that may simply be a typo.
 			return mcp.ErrorResultf("%v: %q is not an open session, so there was nothing to end; call list_sessions to see what is open", session.ErrNoSuchSession, id), nil
 		}
 
-		remaining := mgr.List()
+		remaining := mgr.List(who)
 		var b strings.Builder
 		fmt.Fprintf(&b, "Session %s has been closed and its shell terminated.\n", id)
 		fmt.Fprintf(&b, "%d session(s) still open.", len(remaining))

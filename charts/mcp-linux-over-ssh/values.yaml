@@ -1,0 +1,278 @@
+# Default values for mcp-linux-over-ssh.
+#
+# One replica, always: every open session is a shell held by this one process,
+# so a second replica would not know the session ids the first handed out.
+# There is no replicaCount, HPA or PDB for that reason, and the Deployment
+# uses the Recreate strategy.
+
+image:
+  # Built by ../../build-docker-multi.sh (linux/amd64 + linux/arm64).
+  repository: my-registry.tld/library/mcp-linux-over-ssh
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Public hostname. Used by the Gateway HTTPRoutes and the Gateway listener's
+# cert-manager Certificate. Required with gateway.enabled.
+host: ""
+
+containerPort: 8080
+
+# --- Server configuration (rendered into the config file) ---------------------
+config:
+  logging:
+    level: info      # trace | debug | info | warn | error
+    format: text     # text | json
+  # Browser Origins allowed to call /mcp. Requests with no Origin (agents,
+  # curl) are always allowed. Empty = localhost origins only.
+  allowedOrigins: []
+  # Serve pre-2026-07-28 MCP clients (initialize handshake + sessions) too.
+  legacyCompat:
+    enabled: true
+    sessionTTL: 30m
+
+# --- The sessions this server opens -------------------------------------------
+# Rendered verbatim as the config file's `ssh:` block, so every key of that
+# block is accepted here (see config.yaml.example in the repository, or run
+# the binary with --help-config). command and prompt_regex are required.
+#
+# Durations need a unit: `idle_timeout: 0` does not parse, `0s` does.
+ssh:
+  # The command line that opens one session, run via `sh -c` in the pod. A Go
+  # text/template rendered per session against start_session's arguments.
+  command: ""
+  # Matches the remote shell's prompt. Also a template.
+  prompt_regex: ""
+  # Required over HTTP, and must be greater than zero: nothing else ends a
+  # session whose agent has gone away.
+  idle_timeout: 30m
+  max_sessions: 8
+  # Example: the caller picks the host, the operator fixes everything else.
+  #
+  # command: "ssh -tt psmuser@{{.host}}"
+  # prompt_regex: '(?m)^[^\n]*[$#]\s*$'
+  # parameters:
+  #   - parameter: host
+  #     description: "Hostname of the bastion to connect through"
+  #     pattern: '^[a-z0-9.-]{1,253}$'
+  # login_timeout: 60s
+  # command_timeout: 300s
+  # require_confirmation: false
+
+# Files for the session command's client, mounted read-only at /home/mcp/.ssh:
+# every key of the Secret becomes a file (id_ed25519, known_hosts, config, …).
+#
+#   kubectl create secret generic bastion-ssh \
+#     --from-file=id_ed25519 --from-file=known_hosts --from-file=config
+#
+# The files are root-owned, mode 0440, and readable by the container's uid 1000
+# through the pod's fsGroup. That is what a private key needs here: the client
+# refuses a key with loose permissions only when the calling uid owns it.
+# Empty mounts nothing (a command that needs no key material, or one supplied
+# through extraVolumes).
+sshCredentials:
+  existingSecret: ""
+
+# --- Authentication: kagent agents, by Substrate actor JWT --------------------
+# Always on. This server does not answer /mcp anonymously, and has no other way
+# to authenticate a caller. Tokens are verified against THIS cluster's
+# Substrate issuer only, over TLS pinned to the local servicedns CA bundle;
+# agents of other clusters cannot be admitted.
+actorJwt:
+  issuer: https://idp.ate-system.svc
+  # Defaults to <scheme>://<fullname>.<namespace>.svc.cluster.local (https with
+  # tls.enabled). Must equal an entry of the RemoteMCPServer's
+  # spec.actorJwt.audiences (NOTES prints the RemoteMCPServer).
+  audience: ""
+  # The issuer's CA: this cluster's Substrate servicedns signer.
+  ca:
+    # Project the ClusterTrustBundle. Needs the ClusterTrustBundleProjection
+    # feature, which is on wherever Substrate runs.
+    clusterTrustBundle:
+      enabled: true
+      signerName: servicedns.podcert.ate.dev/identity
+      labelSelector:
+        matchLabels:
+          podcert.ate.dev/canarying: live
+    # Or a ConfigMap holding the PEM bundle (used when the above is disabled).
+    configMap:
+      name: ""
+      key: ca.crt
+  # The local kagent controller's gRPC listener, which maps an actor (one
+  # session's sandbox) to its Agent.
+  kagentController:
+    address: kagent-controller.kagent:8083
+    tls: false
+    # PEM bundle for tls: true; empty uses the system roots.
+    caConfigMap:
+      name: ""
+      key: ca.crt
+  # Agents allowed to use this server, as "namespace/name". Either half may be
+  # a glob that never crosses the "/": "research/*", "team-*/reporter".
+  # Prefer exact names: a namespace glob admits anyone who can create an Agent
+  # there, and every admitted agent can run commands on the hosts this server
+  # reaches. Empty refuses every agent.
+  allowedAgents: []
+  #  - kagent/linux-operator
+
+# --- Agent Skills served to the agents ----------------------------------------
+# Skills are served through the MCP Skills extension. Leave both lists empty to
+# serve none (the extension is then not declared at all).
+skills:
+  # Skills written here in values: each becomes one SKILL.md in a ConfigMap
+  # this chart creates. SKILL.md only; a skill with references/ or scripts/
+  # belongs in its own ConfigMap, below.
+  #
+  #   name:        lowercase letters, digits and single hyphens, at most 64.
+  #   frontmatter: the skill's description (when to use it), as a string. Or a
+  #                map of frontmatter keys, which must include `description`;
+  #                `name` is always taken from the entry.
+  #   skill:       the body of the SKILL.md.
+  inject: []
+  #  - name: rchmgt-etcd-maintenance
+  #    frontmatter: Use these instructions when accessing the wmrchmgt* systems.
+  #    skill: |-
+  #      To compact etcd on the wmrchmgt* systems, run on wmsaltmaster1:
+  #      ./etcd-maintenance.sh <hostname>
+
+  # Existing ConfigMaps, each holding ONE skill: its keys are the skill's files
+  # and must include SKILL.md.
+  #
+  #   kubectl create configmap my-skill --from-file=SKILL.md --from-file=NOTES.md
+  #
+  # `skill` is the directory the files are mounted in and must equal the `name`
+  # in that SKILL.md's frontmatter; it defaults to the ConfigMap's name.
+  configMaps: []
+  #  - name: my-skill
+  #  - name: team-runbooks-cm
+  #    skill: salt-runbook
+
+# --- The pod's own listener TLS ----------------------------------------------
+# Serve HTTPS from the pod itself (in-cluster clients such as kagent then talk
+# TLS to the Service). The certificate is re-read when it changes, so a
+# renewal needs no restart. With enabled: true, choose exactly one source:
+# certManager, existingSecret or volume.
+tls:
+  enabled: false
+  # Issue the serving certificate with cert-manager, for the Service's DNS names.
+  certManager:
+    enabled: false
+    issuerRef:
+      name: ""            # an Issuer/ClusterIssuer able to sign *.svc names (not ACME)
+      kind: ClusterIssuer
+      group: cert-manager.io
+    # Added to <fullname>, <fullname>.<ns>, <fullname>.<ns>.svc and
+    # <fullname>.<ns>.svc.cluster.local.
+    extraDnsNames: []
+  # Or an existing kubernetes.io/tls Secret (tls.crt, tls.key).
+  existingSecret: ""
+  # Or any volume source that yields the two files, for certificates that do
+  # not come from a Secret: a CSI driver today, a SPIFFE helper later.
+  volume: {}
+  #  csi:
+  #    driver: csi.cert-manager.io
+  #    readOnly: true
+  #    volumeAttributes:
+  #      csi.cert-manager.io/issuer-name: cluster-ca
+  #      csi.cert-manager.io/issuer-kind: ClusterIssuer
+  #      csi.cert-manager.io/dns-names: ${POD_NAME}.${POD_NAMESPACE}.svc
+  # File names inside the mount. Change them only for a `volume` whose driver
+  # writes other names.
+  certFile: tls.crt
+  keyFile: tls.key
+
+# --- Service -----------------------------------------------------------------
+service:
+  type: ClusterIP       # ClusterIP, NodePort or LoadBalancer
+  # Defaults to 443 with tls.enabled, else 80.
+  port: ""
+  nodePort: ""
+  annotations: {}
+
+# --- Gateway API -------------------------------------------------------------
+gateway:
+  # HTTPRoute attached to an existing Gateway. Routes /mcp and nothing else.
+  enabled: false
+  parentRefs:
+    - name: my-gateway
+      namespace: gateway-system
+      # The HTTPS listener. Required when httpRedirect is enabled, otherwise
+      # both routes would attach to every listener.
+      sectionName: https
+  annotations: {}
+  # A second HTTPRoute on the plain-HTTP listener that 301-redirects to https://.
+  httpRedirect:
+    enabled: false
+    sectionName: http
+  # Let Gateways in other namespaces read the listener certificate Secret.
+  referenceGrant:
+    enabled: false
+    # Defaults to the namespaces named in parentRefs.
+    namespaces: []
+  # Required with tls.enabled: the Gateway must speak TLS to the pod. The API
+  # version follows your Gateway API release: gateway.networking.k8s.io/v1 from
+  # v1.4, v1alpha3 for v1.3.
+  backendTLS:
+    enabled: false
+    apiVersion: gateway.networking.k8s.io/v1
+    # Hostname the pod's certificate is checked against.
+    # Defaults to <fullname>.<namespace>.svc.
+    hostname: ""
+    # ConfigMap(s) holding the CA that signed the pod's certificate.
+    caCertificateRefs: []
+    #  - group: ""
+    #    kind: ConfigMap
+    #    name: cluster-ca
+    # Or trust the Gateway implementation's system roots.
+    wellKnownCACertificates: ""   # "System"
+
+# The Gateway listener's certificate for `host`, via cert-manager. Off by
+# default. Your Gateway's HTTPS listener must reference its Secret
+# (certManager.secretName / <fullname>-tls).
+certManager:
+  enabled: false
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+  secretName: ""
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# The image's user "mcp" (uid/gid 1000). The uid must stay 1000: the session
+# command's client looks its own uid up in the image's passwd file. fsGroup is
+# what makes the sshCredentials files readable.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Read-only root filesystem; the only writable mount is /tmp.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Passed through to the container and pod as written.
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

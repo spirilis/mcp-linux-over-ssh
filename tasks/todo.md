@@ -531,3 +531,98 @@ server up against it and decide what, if anything, is worth adopting.
   `completion/complete` and `skills/list` return `-32601`.
 - `TestWatchStdinReportsEOFWithoutTouchingTheGlobal` added and mutation-checked by
   reintroducing `os.Stdin = pr` (it fails).
+
+## Upgrade to generic-go-mcp v0.11.1 (2026-11-25)
+
+The library moved v0.8.1 → v0.11.1. Goal: take the newest release and decide what, if
+anything, in it applies to a stdio-only server.
+
+- [x] **The upgrade is drop-in.** `go get` to v0.11.1 and `go mod tidy`; `go build`, `go vet`
+      and the full `-race` suite pass with zero source changes.
+- [x] **Scoped what actually changed** by diffing the two module-cache trees. Outside `auth/`,
+      `transport/http.go` and the OAuth config struct — none of which this server exercises —
+      only `mcp/skills.go` and the capability logic in `mcp/server.go` moved.
+      `transport/stream.go`, `transport/stdio.go`, `compat/overlay.go` and `mcp/resources.go`
+      are byte-identical (`cmp`).
+- [x] **Confirmed the advertised capabilities did not move** — still exactly
+      `[resources, tools]` on `server/discover` and on a legacy 2025-11-25 `initialize`.
+      `capabilities()` is the one function this server depends on that changed (it now also
+      declares `resources` when skills are enabled), so this was checked on the built binary
+      rather than inferred.
+- [x] **The `Done()` deadlock note still holds.** Not re-reproduced in a standalone program:
+      the two transport files it lives in are unchanged, and the library docs still recommend
+      the `<-trans.Done()` pattern. CLAUDE.md and the `watchStdin` comment now say so.
+- [ ] **Open decision: the skills extension.** Declined at v0.8.1 as an unmerged draft; it is
+      now Beta and v0.11.0 is the first tag with the wire shape hosts accept. Not adopted in
+      this pass because it changes what the server advertises. Costs and the case for it are
+      in CLAUDE.md under "The v0.11.1 surface this server deliberately does not use".
+- [ ] **Release.** `serverVersion` is still `0.4.0` and nothing is tagged, so
+      `go install …@latest` does not carry this upgrade yet.
+
+#### Verification
+
+- `go build`, `go vet`, `gofmt -l`, and `go test ./... -race` all clean.
+- End-to-end on the built binary against a `bash -i` config: `tools/list` lists the five
+  tools; `skills/list` and `completion/complete` answer `-32601`; `resources/templates/list`
+  returns an empty list.
+- EOF with a parked `subscriptions/listen` exits 0 in ~0.6s (0.3s of which is the driver's
+  own sleep before closing stdin).
+
+## Skills from disk, HTTP for kagent agents, image and chart (2026-11-25)
+
+Goal: make this deployable "in specific places" to extend what agents can reach — serve
+operator-written skills, accept kagent agents over HTTP with actor JWT (never anonymous),
+and ship a Dockerfile and Helm chart with Gateway API, cert-manager and optional in-pod TLS.
+
+- [x] **`--skills <dir>`**, repeatable; a directory holding a `SKILL.md` or a directory of
+      such directories. Follows symlinks and skips dot-entries so a ConfigMap mount works.
+- [x] **`server.mode: http`** with actor JWT as the only credential. No anonymous mode, no
+      OAuth (an `auth:` block is a startup error), no static token.
+- [x] **Sessions scoped to their caller** (Agent + kagent session), in `session.Manager`.
+      Not asked for; it is what going multi-caller requires. Stdio is unchanged.
+- [x] **`ssh.idle_timeout` required in http mode** — nothing else ends an orphan there.
+- [x] **Optional in-process TLS** with hot-reloaded certificate files.
+- [x] **Dockerfile** updated (still alpine; needs `sh`, `ssh` and a passwd entry).
+- [x] **Chart** `charts/mcp-linux-over-ssh`: Gateway API (route, redirect, ReferenceGrant,
+      BackendTLSPolicy), two cert-manager Certificates, `tls.volume` for other sources,
+      `skills.inject[]` and `skills.configMaps[]`, `~/.ssh` from a Secret.
+- [x] `serverVersion` and chart `appVersion` bumped to 0.5.0 together, with a test tying them.
+- [ ] **Not done:** a discover-only credential (so kagent's UI can list tools); additional
+      issuers for other clusters; SPIFFE beyond the generic `tls.volume` hook;
+      `resources/list` still enumerates every caller's session URIs (inert, but visible).
+      Nothing is committed, tagged or pushed.
+- [x] **Change notifications clamped to their owner** (follow-up, same day): `notify.go`.
+      Per-session URIs are dropped from a non-owner's subscription; index updates and
+      `list_changed` are relayed only to the owner whose change caused them. Covers the
+      legacy GET stream. Stdio untouched.
+
+#### Verification
+
+- `go build`, `go vet`, `gofmt -l` clean; `go test ./... -race` green across all 7 packages.
+- Anonymous denial observed on the served handler and on the running image: no token, a
+  garbage bearer, a forged JWT and a legacy `initialize` all get 401; an Agent off the
+  allowlist gets 403; `/healthz` and `/readyz` answer without a token.
+- Isolation observed over real HTTP with real shells, as another Agent, another
+  conversation of the same Agent, and a legacy-era client. Mutation-checked: removing the
+  owner comparison, the resource check, or the `AuthService` assignment each fails a test.
+- Skills: kubelet-layout fixture (hidden `..data`, symlinked entries) loads; every file read
+  back through `resources/read` matches its manifest digest and size.
+- The `skills.inject` example from the request, verbatim, renders and loads in the real
+  loader; the README's example values render and lint.
+- Image built for linux/amd64 and linux/arm64; run read-only as uid 1000 with all
+  capabilities dropped, using the chart's rendered config and both skill mount shapes:
+  starts, serves 2 skills, exits 0 on SIGTERM. HTTP mode without `actor_jwt` exits 1.
+- SSH key rule the chart depends on, checked on the image's OpenSSH 10.0: a root-owned
+  0440 key readable through the group loads; a self-owned 0440 key is rejected.
+- Full chart render (Gateway, redirect, both Certificates, BackendTLSPolicy,
+  ReferenceGrant, ClusterTrustBundle projection) passes `kubectl apply --dry-run=server`
+  on linode and apollo. Nothing was installed.
+- Stdio unchanged: capabilities `[resources, tools]` without `--skills`; EOF with a parked
+  `subscriptions/listen` still exits 0 in ~0.6s.
+- In-process TLS on the image, from the config the chart renders for `tls.existingSecret`:
+  `/healthz` answers over HTTPS with the certificate verified, an anonymous POST still gets
+  401, and plain HTTP to that port is refused.
+- A real session inside the image over stdio, read-only root, uid 1000, capabilities
+  dropped: `start_session` reaches `ready`, `run_bash` returns exit 0, `ssh` is on the path.
+- **Not verified:** a real actor JWT from a real Substrate issuer, the kagent controller
+  lookup against a real controller, or a real pod. The auth path is tested against fakes.

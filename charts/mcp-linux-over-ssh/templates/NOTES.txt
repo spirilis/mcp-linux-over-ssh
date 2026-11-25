@@ -1,0 +1,86 @@
+{{- $fullname := include "mcp-linux-over-ssh.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{ .Chart.Name }} {{ .Chart.AppVersion }} deployed as {{ $fullname }} in namespace {{ $ns }}.
+
+  In-cluster endpoint: {{ include "mcp-linux-over-ssh.serviceURL" . }}
+  Sessions: at most {{ .Values.ssh.max_sessions | default 8 }} at a time, closed after {{ .Values.ssh.idle_timeout }} idle. They live in the
+  one pod: restarting or upgrading the release ends every open session.
+{{- if .Values.sshCredentials.existingSecret }}
+  Credentials: Secret "{{ .Values.sshCredentials.existingSecret }}" mounted read-only at /home/mcp/.ssh.
+{{- else }}
+  Credentials: none mounted (sshCredentials.existingSecret is empty).
+{{- end }}
+{{- if .Values.tls.enabled }}
+  The pod serves TLS ({{ if .Values.tls.certManager.enabled }}cert-manager Certificate {{ $fullname }}-serving{{ else if .Values.tls.existingSecret }}Secret {{ .Values.tls.existingSecret }}{{ else }}the volume in tls.volume{{ end }});
+  renewed certificates are picked up without a restart.
+{{- end }}
+
+  Authentication: kagent agents only, by actor JWT. Anonymous requests to /mcp are refused.
+  Tokens are verified against {{ .Values.actorJwt.issuer }} (this cluster only).
+  Allowed agents: {{ if .Values.actorJwt.allowedAgents }}{{ join ", " .Values.actorJwt.allowedAgents }}{{ else }}NONE. Every agent is refused until actorJwt.allowedAgents is set.{{ end }}
+  Create the RemoteMCPServer like this:
+
+     apiVersion: api.kagent.dev/v1alpha3
+     kind: RemoteMCPServer
+     metadata:
+       name: {{ $fullname }}
+     spec:
+       description: Run commands on remote hosts through persistent shell sessions
+       url: {{ include "mcp-linux-over-ssh.serviceURL" . }}
+       actorJwt:
+         audiences: ["{{ include "mcp-linux-over-ssh.actorAudience" . }}", "kagent-agent-info"]
+         expirationSeconds: 900
+
+  kagent cannot list this server's tools in its UI (its control plane has no actor identity);
+  agents list them at run time.
+{{- if or .Values.skills.inject .Values.skills.configMaps }}
+
+  Skills served:
+  {{- range .Values.skills.inject }}
+    {{ .name }}  (from values)
+  {{- end }}
+  {{- range .Values.skills.configMaps }}
+    {{ include "mcp-linux-over-ssh.configMapSkillName" . }}  (ConfigMap {{ .name }})
+  {{- end }}
+  {{- if .Values.skills.configMaps }}
+  Each ConfigMap must hold a SKILL.md whose frontmatter `name` equals the skill name above,
+  or the pod will not start. A ConfigMap edited later is picked up on the next restart:
+    kubectl -n {{ $ns }} rollout restart deployment/{{ $fullname }}
+  {{- end }}
+{{- else }}
+
+  Skills served: none (see skills.inject and skills.configMaps).
+{{- end }}
+{{- if .Values.gateway.enabled }}
+
+  Public URL: https://{{ .Values.host }}/mcp
+  Exposure: Gateway API (HTTPRoute -> {{ range $i, $r := .Values.gateway.parentRefs }}{{ if $i }}, {{ end }}{{ with $r.namespace }}{{ . }}/{{ end }}{{ $r.name }}{{ with $r.sectionName }}:{{ . }}{{ end }}{{ end }})
+  {{- if .Values.gateway.httpRedirect.enabled }}
+  HTTP -> HTTPS: {{ $fullname }}-redirect answers on listener "{{ .Values.gateway.httpRedirect.sectionName }}" with a 301.
+  {{- end }}
+  {{- if .Values.gateway.backendTLS.enabled }}
+  Gateway -> pod: TLS, verified by BackendTLSPolicy {{ $fullname }} ({{ .Values.gateway.backendTLS.apiVersion }}).
+  {{- end }}
+  {{- if .Values.certManager.enabled }}
+  Listener TLS: cert-manager writes Secret "{{ include "mcp-linux-over-ssh.gatewayTLSSecretName" . }}" in "{{ $ns }}".
+  Point your Gateway's HTTPS listener at it, e.g.:
+
+    listeners:
+      - name: https-{{ $fullname }}
+        hostname: {{ .Values.host | quote }}
+        port: 443
+        protocol: HTTPS
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - name: {{ include "mcp-linux-over-ssh.gatewayTLSSecretName" . }}
+              namespace: {{ $ns }}
+  {{- if not .Values.gateway.referenceGrant.enabled }}
+  If the Gateway is in a different namespace, also enable gateway.referenceGrant.
+  {{- end }}
+  {{- end }}
+{{- end }}
+
+  Local access:
+    kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} 8080:{{ include "mcp-linux-over-ssh.servicePort" . }}
+    then POST MCP requests to {{ include "mcp-linux-over-ssh.scheme" . }}://localhost:8080/mcp (a valid actor JWT is still required)

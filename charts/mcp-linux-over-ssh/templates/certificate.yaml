@@ -1,0 +1,53 @@
+{{- /*
+Up to two Certificates, for two different listeners:
+  - the Gateway's HTTPS listener, for the public `host` (certManager.*);
+  - the pod's own listener, for the Service's cluster-internal names (tls.certManager.*).
+They need different issuers (an ACME issuer cannot sign *.svc names), so they are kept apart.
+*/ -}}
+{{- if and .Values.certManager.enabled .Values.gateway.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "mcp-linux-over-ssh.gatewayTLSSecretName" . }}
+  dnsNames:
+    - {{ .Values.host | quote }}
+  # Explicit, since cert-manager v1.18 changed the default (and warns about it).
+  privateKey:
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.certManager.issuerRef.name }}
+    kind: {{ .Values.certManager.issuerRef.kind }}
+    group: {{ .Values.certManager.issuerRef.group }}
+{{- end }}
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- $fullname := include "mcp-linux-over-ssh.fullname" . }}
+{{- $ns := .Release.Namespace }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-serving
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "mcp-linux-over-ssh.servingTLSSecretName" . }}
+  dnsNames:
+    - {{ $fullname }}
+    - {{ $fullname }}.{{ $ns }}
+    - {{ $fullname }}.{{ $ns }}.svc
+    - {{ $fullname }}.{{ $ns }}.svc.cluster.local
+    {{- range .Values.tls.certManager.extraDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  usages: ["server auth", "digital signature", "key encipherment"]
+  privateKey:
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ .Values.tls.certManager.issuerRef.name }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    group: {{ .Values.tls.certManager.issuerRef.group }}
+{{- end }}

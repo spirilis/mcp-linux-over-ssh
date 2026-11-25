@@ -27,7 +27,7 @@ func newTestManager(t *testing.T, max int, idleTimeout time.Duration) *Manager {
 // what a caller of start_session does by polling list_sessions.
 func startReady(t *testing.T, m *Manager, params map[string]string) string {
 	t.Helper()
-	id, err := m.Start(testConfig(), params)
+	id, err := m.Start("", testConfig(), params)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -41,7 +41,7 @@ func waitForState(t *testing.T, m *Manager, id string, want State) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		sess, ok := m.Get(id)
+		sess, ok := m.Get("", id)
 		if !ok {
 			t.Fatalf("session %s disappeared while waiting for %q", id, want)
 		}
@@ -65,7 +65,7 @@ func TestManagerOpensAndEndsASession(t *testing.T) {
 		t.Fatalf("Len() = %d, want 1", m.Len())
 	}
 
-	sess, ok := m.Get(id)
+	sess, ok := m.Get("", id)
 	if !ok {
 		t.Fatal("Get did not find the session just started")
 	}
@@ -78,7 +78,7 @@ func TestManagerOpensAndEndsASession(t *testing.T) {
 	}
 
 	// The parameters are echoed back so a listing says which target a session reached.
-	infos := m.List()
+	infos := m.List("")
 	if len(infos) != 1 {
 		t.Fatalf("List() returned %d entries, want 1", len(infos))
 	}
@@ -86,16 +86,16 @@ func TestManagerOpensAndEndsASession(t *testing.T) {
 		t.Errorf("listed parameters = %v, want host=localhost", infos[0].Parameters)
 	}
 
-	if !m.End(id) {
+	if !m.End("", id) {
 		t.Error("End reported that the session was not found")
 	}
 	if m.Len() != 0 {
 		t.Errorf("Len() = %d after End, want 0", m.Len())
 	}
-	if _, ok := m.Get(id); ok {
+	if _, ok := m.Get("", id); ok {
 		t.Error("Get still resolves an ended session id")
 	}
-	if m.End(id) {
+	if m.End("", id) {
 		t.Error("End reported success for an id it had already removed")
 	}
 }
@@ -108,7 +108,7 @@ func TestManagerEnforcesTheSessionCap(t *testing.T) {
 	first := startReady(t, m, nil)
 	startReady(t, m, nil)
 
-	_, err := m.Start(testConfig(), nil)
+	_, err := m.Start("", testConfig(), nil)
 	if err == nil {
 		t.Fatal("expected the third Start to be refused")
 	}
@@ -117,8 +117,8 @@ func TestManagerEnforcesTheSessionCap(t *testing.T) {
 	}
 
 	// Ending one frees its slot rather than merely hiding it.
-	m.End(first)
-	if _, err := m.Start(testConfig(), nil); err != nil {
+	m.End("", first)
+	if _, err := m.Start("", testConfig(), nil); err != nil {
 		t.Errorf("Start after End: %v", err)
 	}
 }
@@ -129,7 +129,7 @@ func TestManagerCapIgnoresDeadSessions(t *testing.T) {
 	m := newTestManager(t, 1, 0)
 
 	id := startReady(t, m, nil)
-	sess, _ := m.Get(id)
+	sess, _ := m.Get("", id)
 
 	// Kill the shell the way one really dies: pull the PTY out from under the reader.
 	sess.closeProc()
@@ -138,7 +138,7 @@ func TestManagerCapIgnoresDeadSessions(t *testing.T) {
 	if live := m.Live(); live != 0 {
 		t.Errorf("Live() = %d with one dead session, want 0", live)
 	}
-	if _, err := m.Start(testConfig(), nil); err != nil {
+	if _, err := m.Start("", testConfig(), nil); err != nil {
 		t.Errorf("a dead session consumed the only slot: %v", err)
 	}
 	// The dead one is still listed, so the model can see why it died.
@@ -155,8 +155,8 @@ func TestManagerKeepsSessionsIndependent(t *testing.T) {
 	ctx := context.Background()
 
 	a, b := startReady(t, m, nil), startReady(t, m, nil)
-	sessA, _ := m.Get(a)
-	sessB, _ := m.Get(b)
+	sessA, _ := m.Get("", a)
+	sessB, _ := m.Get("", b)
 
 	// Compared against B's own starting directory rather than against a literal, since
 	// both shells inherit this process's cwd and that cwd may itself sit under /tmp.
@@ -203,7 +203,7 @@ func TestManagerLifecycleObserverFiresOnceEachWay(t *testing.T) {
 	var mu sync.Mutex
 	var added, removed []string
 	m.SetLifecycleObserver(
-		func(id string, s *Session) {
+		func(id, _ string, s *Session) {
 			if s == nil {
 				t.Error("onAdd received a nil session")
 			}
@@ -211,7 +211,7 @@ func TestManagerLifecycleObserverFiresOnceEachWay(t *testing.T) {
 			added = append(added, id)
 			mu.Unlock()
 		},
-		func(id string) {
+		func(id, _ string) {
 			mu.Lock()
 			removed = append(removed, id)
 			mu.Unlock()
@@ -227,8 +227,8 @@ func TestManagerLifecycleObserverFiresOnceEachWay(t *testing.T) {
 		t.Fatalf("added = %v, want exactly [%s]", gotAdded, id)
 	}
 
-	m.End(id)
-	m.End(id) // the second is a no-op and must not announce a second removal
+	m.End("", id)
+	m.End("", id) // the second is a no-op and must not announce a second removal
 
 	mu.Lock()
 	gotRemoved := append([]string(nil), removed...)
@@ -251,7 +251,7 @@ func TestManagerLifecycleObserverFiresOnceEachWay(t *testing.T) {
 func TestManagerEndCancelsACommandInFlight(t *testing.T) {
 	m := newTestManager(t, 4, 0)
 	id := startReady(t, m, nil)
-	sess, _ := m.Get(id)
+	sess, _ := m.Get("", id)
 
 	type outcome struct {
 		res *Result
@@ -267,7 +267,7 @@ func TestManagerEndCancelsACommandInFlight(t *testing.T) {
 	waitForState(t, m, id, StateBusy)
 
 	ended := make(chan bool, 1)
-	go func() { ended <- m.End(id) }()
+	go func() { ended <- m.End("", id) }()
 
 	select {
 	case ok := <-ended:
@@ -291,7 +291,7 @@ func TestManagerEndCancelsACommandInFlight(t *testing.T) {
 	}
 
 	// The id is unusable either way, which is the part a caller of end_session relies on.
-	if _, ok := m.Get(id); ok {
+	if _, ok := m.Get("", id); ok {
 		t.Error("Get still resolves a session that was ended")
 	}
 }
@@ -302,7 +302,7 @@ func TestManagerReapsIdleSessionsButNotBusyOnes(t *testing.T) {
 	idle := startReady(t, m, nil)
 	busy := startReady(t, m, nil)
 
-	busySess, _ := m.Get(busy)
+	busySess, _ := m.Get("", busy)
 	go func() { _, _ = busySess.Execute(context.Background(), "sleep 8") }()
 	waitForState(t, m, busy, StateBusy)
 
@@ -328,7 +328,7 @@ func TestManagerReapsIdleSessionsButNotBusyOnes(t *testing.T) {
 
 // listed reports whether id is still registered, without marking it as used.
 func listed(m *Manager, id string) bool {
-	for _, in := range m.List() {
+	for _, in := range m.List("") {
 		if in.ID == id {
 			return true
 		}
@@ -346,7 +346,7 @@ func TestManagerStartRejectsAnUncompilablePromptRegex(t *testing.T) {
 	cfg := testConfig()
 	cfg.PromptRegex = "([unclosed"
 
-	if _, err := m.Start(cfg, nil); err == nil {
+	if _, err := m.Start("", cfg, nil); err == nil {
 		t.Fatal("expected an error for a prompt regex that does not compile")
 	}
 	if m.Len() != 0 {
@@ -405,7 +405,7 @@ func TestManagerGateRefusesNewSessions(t *testing.T) {
 	m.SetGate(gate, 0) // no poll loop: this is only about admission
 	raise()
 
-	_, err := m.Start(testConfig(), nil)
+	_, err := m.Start("", testConfig(), nil)
 	if err == nil {
 		t.Fatal("Start succeeded while the disable flag was raised")
 	}
@@ -428,7 +428,7 @@ func TestManagerGateOutranksTheSessionCap(t *testing.T) {
 	m.SetGate(gate, 0)
 	raise()
 
-	_, err := m.Start(testConfig(), nil)
+	_, err := m.Start("", testConfig(), nil)
 	if errors.Is(err, ErrSessionLimit) {
 		t.Errorf("error = %v, want the administrative reason rather than the cap", err)
 	}
@@ -449,7 +449,7 @@ func TestManagerGateTerminatesIdleSessionsAndWaitsForBusyOnes(t *testing.T) {
 	idle := startReady(t, m, nil)
 	busy := startReady(t, m, nil)
 
-	busySess, _ := m.Get(busy)
+	busySess, _ := m.Get("", busy)
 	commandDone := make(chan struct{})
 	go func() {
 		defer close(commandDone)
@@ -474,7 +474,7 @@ func TestManagerGateTerminatesIdleSessionsAndWaitsForBusyOnes(t *testing.T) {
 
 	// And the far side of the switch: removing the file restores service with no restart.
 	clear()
-	if _, err := m.Start(testConfig(), nil); err != nil {
+	if _, err := m.Start("", testConfig(), nil); err != nil {
 		t.Errorf("Start after clearing the flag: %v", err)
 	}
 }
@@ -488,5 +488,52 @@ func waitUntilGone(t *testing.T, m *Manager, id string, within time.Duration, ms
 			t.Fatal(msg)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A session belongs to whoever opened it. To anyone else it must be indistinguishable from
+// an id that was never issued — and a lookup by someone else must not count as use, or a
+// caller probing for another's session could hold it open past the idle reaper forever.
+func TestManagerScopesSessionsToTheirOwner(t *testing.T) {
+	m := newTestManager(t, 4, 0)
+
+	id, err := m.Start("alice", testConfig(), nil)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := m.Start("bob", testConfig(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	before := m.List("alice")
+	if len(before) != 1 || before[0].ID != id {
+		t.Fatalf("alice sees %+v, want exactly her own session", before)
+	}
+	if got := m.List(""); len(got) != 0 {
+		t.Errorf("the empty owner sees %d sessions it did not open; it is an owner like any other, not a wildcard", len(got))
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	for _, who := range []string{"bob", "", "alice "} {
+		if _, ok := m.Get(who, id); ok {
+			t.Errorf("Get(%q) found alice's session", who)
+		}
+		if m.End(who, id) {
+			t.Errorf("End(%q) ended alice's session", who)
+		}
+	}
+	if after := m.List("alice"); len(after) != 1 || !after[0].LastUsed.Equal(before[0].LastUsed) {
+		t.Errorf("a stranger's lookup changed alice's session: %+v", after)
+	}
+
+	if _, ok := m.Get("alice", id); !ok {
+		t.Error("alice cannot find her own session")
+	}
+	if !m.End("alice", id) {
+		t.Error("alice cannot end her own session")
+	}
+	// The cap and shutdown are the server's, not any owner's.
+	if m.Len() != 1 {
+		t.Errorf("Len = %d after alice ended hers, want bob's 1", m.Len())
 	}
 }

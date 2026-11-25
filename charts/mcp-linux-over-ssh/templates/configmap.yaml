@@ -1,0 +1,44 @@
+{{- $p := include "mcp-linux-over-ssh.paths" . | fromYaml -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    server:
+      mode: http
+      http:
+        host: 0.0.0.0
+        port: {{ .Values.containerPort }}
+        {{- with .Values.config.allowedOrigins }}
+        allowed_origins:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      legacy_compat:
+        enabled: {{ .Values.config.legacyCompat.enabled }}
+        session_ttl: {{ .Values.config.legacyCompat.sessionTTL | quote }}
+    logging:
+      level: {{ .Values.config.logging.level }}
+      format: {{ .Values.config.logging.format }}
+    {{- if .Values.tls.enabled }}
+    tls:
+      enabled: true
+      cert_file: {{ $p.tls }}/{{ .Values.tls.certFile }}
+      key_file: {{ $p.tls }}/{{ .Values.tls.keyFile }}
+    {{- end }}
+    actor_jwt:
+      enabled: true
+      issuer: {{ .Values.actorJwt.issuer | quote }}
+      audience: {{ include "mcp-linux-over-ssh.actorAudience" . | quote }}
+      ca_file: {{ $p.issuerCA }}
+      allowed_agents: {{ .Values.actorJwt.allowedAgents | default list | toJson }}
+      kagent_controller:
+        address: {{ .Values.actorJwt.kagentController.address | quote }}
+        tls: {{ .Values.actorJwt.kagentController.tls }}
+        {{- if .Values.actorJwt.kagentController.caConfigMap.name }}
+        ca_file: {{ $p.kagentCA }}
+        {{- end }}
+    ssh:
+      {{- toYaml .Values.ssh | nindent 6 }}

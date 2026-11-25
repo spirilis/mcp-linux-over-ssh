@@ -1,5 +1,7 @@
-// Command mcp-linux-over-ssh is a stdio-only MCP server (protocol 2026-07-28) that runs
-// commands on remote hosts through persistent SSH shell sessions.
+// Command mcp-linux-over-ssh is an MCP server (protocol 2026-07-28) that runs commands on
+// remote hosts through persistent SSH shell sessions. It speaks over stdio to the client
+// that launched it, or over HTTP to kagent agents that authenticate with an actor JWT; see
+// http.go for the second and for why it is never anonymous.
 //
 // Sessions are opened on demand by the start_session tool rather than at startup: the
 // target is chosen per connection from parameters the config declares, and several
@@ -30,12 +32,13 @@ import (
 
 	"github.com/spirilis/mcp-linux-over-ssh/config"
 	"github.com/spirilis/mcp-linux-over-ssh/session"
+	"github.com/spirilis/mcp-linux-over-ssh/skills"
 	"github.com/spirilis/mcp-linux-over-ssh/tools"
 )
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.4.0"
+	serverVersion = "0.5.0"
 
 	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
 	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
@@ -49,6 +52,7 @@ func main() {
 	logLevel := pflag.String("log-level", "", "Override logging.level from the config file")
 	helpConfig := pflag.Bool("help-config", false, "Print annotated example configurations and exit")
 	showVersion := pflag.Bool("version", false, "Print version and build information and exit")
+	skillRoots := pflag.StringArray("skills", nil, "Directory of Agent Skills to serve: one holding a SKILL.md, or one whose subdirectories each hold one. Repeatable")
 	pflag.Parse()
 
 	// Both are checked before --config is required, since not having one yet is the whole
@@ -98,9 +102,13 @@ func main() {
 	}
 	logging.Initialize(level, cfg.Lib.Logging.Format, logOut)
 
-	if cfg.Lib.Server.Mode != "stdio" {
-		logging.Error("this server is stdio-only", "configured_mode", cfg.Lib.Server.Mode)
-		os.Exit(1)
+	// Who a request is made for. Over stdio that is the one process that launched this
+	// server; over HTTP it is whoever the auth middleware attested, and a request without
+	// one is refused rather than treated as stdio's implicit caller.
+	httpMode := cfg.HTTPMode()
+	owner := tools.OwnerFunc(tools.SingleCaller)
+	if httpMode {
+		owner = authenticatedOwner
 	}
 
 	compatEnabled := cfg.LegacyCompatEnabled()
@@ -111,22 +119,6 @@ func main() {
 		// loudly rather than silently changing the security posture of an existing
 		// deployment that upgrades and picks up the new default.
 		logging.Warn("require_confirmation defaulted to false because legacy MCP compatibility is enabled and MRTR confirmation cannot reach a pre-2026-07-28 client; set require_confirmation explicitly in the config to override")
-	}
-
-	// Everything that is not per-connection. start_session fills in Command and
-	// PromptRegex by rendering cfg.Renderer against the values it was called with.
-	baseSession := session.Config{
-		LoginTimeout:    cfg.SSH.LoginTimeout,
-		CommandTimeout:  cfg.SSH.CommandTimeout,
-		RecoveryTimeout: cfg.SSH.RecoveryTimeout,
-		Term:            cfg.SSH.Term,
-		Cols:            cfg.SSH.Cols,
-		Rows:            cfg.SSH.Rows,
-		InitCommands:    cfg.SSH.InitCommands,
-		UseSentinel:     cfg.SSH.UseSentinelValue(),
-		MaxOutputBytes:  cfg.SSH.MaxOutputBytes,
-		TranscriptBytes: cfg.SSH.TranscriptBytes,
-		AllowReconnect:  cfg.SSH.AllowReconnect,
 	}
 
 	mgr := session.NewManager(cfg.SSH.MaxSessions, cfg.SSH.IdleTimeout)
@@ -149,87 +141,19 @@ func main() {
 		}
 	}
 
-	resourceRegistry := mcp.NewResourceRegistry()
-	registerSessionsIndex(resourceRegistry, mgr)
-
-	registry := mcp.NewToolRegistry()
-	registry.Register(tools.NewStartSession(mgr, cfg.Renderer, baseSession))
-	registry.Register(tools.NewListSessions(mgr))
-	registry.Register(tools.NewEndSession(mgr))
-	registry.Register(tools.NewRunBash(mgr, requireConfirmation))
-	registry.Register(tools.NewTunePromptRegex(mgr))
-	if mgr.Gated() {
-		// Registered only when a gate exists, so the tool's presence in tools/list is itself
-		// the answer to whether this server can be disabled at all. A permanently-false
-		// check on every deployment would teach a caller to skip it on the ones where it
-		// means something.
-		registry.Register(tools.NewIsDisabledByFlag(mgr))
+	handlerInner, legacySessions, err := assemble(cfg, mgr, owner, requireConfirmation, *skillRoots)
+	if err != nil {
+		logging.Error("error assembling the server", "error", err)
+		// Nothing can be open yet, but os.Exit skips the deferred CloseAll; see below.
+		mgr.CloseAll()
+		os.Exit(1)
 	}
 
-	listTTL := int64(listTTLMs)
-	serverCfg := &mcp.ServerConfig{
-		Name:         serverName,
-		Version:      serverVersion,
-		Instructions: instructions(requireConfirmation, cfg.Renderer.Parametric(), mgr.Gated()),
-		ListTTLMs:    &listTTL,
-	}
-	if compatEnabled {
-		// Feed server/discover, the legacy initialize diagnostic, and -32022 from one
-		// list, so a client is never told three different stories about what this server
-		// speaks.
-		serverCfg.AdvertisedVersions = append([]string{mcp.ProtocolVersion}, compat.LegacyVersions...)
-	}
-	server := mcp.NewServer(registry, resourceRegistry, serverCfg)
-
-	// After NewServer, which is what attaches the registry to the notification broker: a
-	// NotifyUpdated on a detached registry reaches nobody. Sessions are created by tool
-	// calls, which cannot arrive until the transport is serving, so this is comfortably
-	// early enough — but it must precede the first start_session either way, since a
-	// session that joined without it would never announce anything.
-	mgr.SetLifecycleObserver(
-		func(id string, sess *session.Session) {
-			// Registered before the observer is installed, so no notification can be
-			// aimed at a URI the registry does not know yet. Both run before the login
-			// handshake begins, which is what lets a subscriber watch that handshake's
-			// own transitions rather than missing all of them.
-			registerSessionResources(resourceRegistry, id, sess)
-
-			statusURI := tools.StatusURI(id)
-			sess.SetStatusObserver(func(st session.Status) {
-				// busy/ready is two lines per command and tells an operator nothing; the
-				// states worth waking up for are the ones that need a human or a repair.
-				if st.State == session.StateBusy.String() || st.State == session.StateReady.String() {
-					logging.Debug("session status changed", "session_id", id, "state", st.State, "commands_run", st.CommandsRun)
-				} else {
-					logging.Info("session status changed", "session_id", id, "state", st.State, "last_error", st.LastError)
-				}
-				resourceRegistry.NotifyUpdated(statusURI)
-				// The index carries every session's state, so it changed too. A client
-				// watching the collection rather than one session is the likelier case
-				// now that ids are not known ahead of time.
-				resourceRegistry.NotifyUpdated(tools.SessionsURI)
-			})
-		},
-		func(id string) {
-			// Unregistering fires resources/list_changed; the session's own final "dead"
-			// update has already gone out, because Manager.End closes before it removes.
-			resourceRegistry.Unregister(tools.StatusURI(id))
-			resourceRegistry.Unregister(tools.TranscriptURI(id))
-			resourceRegistry.NotifyUpdated(tools.SessionsURI)
-		},
-	)
-
-	// Wrap server in the legacy-compat overlay, not the other way around: the overlay
-	// translates a pre-2026-07-28 request into the modern wire shape and forwards it to
-	// server unchanged, so everything above this line (tools, resources, the status
-	// observer) stays oblivious to which era a given caller is on.
-	var handlerInner transport.MessageHandler = server
-	if compatEnabled {
-		handlerInner = compat.New(server, compat.Config{
-			SessionTTL: cfg.LegacyCompatSessionTTL(),
-			ServerInfo: mcp.Implementation{Name: serverName, Version: serverVersion},
-		})
-		logging.Info("legacy MCP compatibility enabled", "advertised_versions", serverCfg.AdvertisedVersions)
+	if httpMode {
+		// Everything from here on differs: there is no stdin whose closing means "done",
+		// and the listener is owned by this process rather than by the transport. See
+		// http.go. The stdio path below is untouched by HTTP support.
+		os.Exit(serveHTTP(cfg, mgr, handlerInner, legacySessions, level, logOut))
 	}
 	handler := &drainingHandler{inner: handlerInner}
 
@@ -291,6 +215,176 @@ func main() {
 	// death once, so the second pass is a no-op.
 	mgr.CloseAll()
 	logging.Info("shutdown complete")
+}
+
+// assemble builds everything between the session manager and the transport: the tools, the
+// resources, the optional skills, the protocol server, and the legacy-compat overlay around
+// it. It returns the handler a transport serves, plus the hook HTTP needs for a legacy
+// client's GET and DELETE (nil when compat is off).
+//
+// It is a function rather than a stretch of main so that the tests can stand up the same
+// stack the process serves. The properties worth testing here — a caller cannot reach
+// another caller's session, an anonymous request reaches nothing — are properties of how
+// these pieces are wired together, and a test that wired its own copy would be testing the
+// copy.
+func assemble(cfg *config.Config, mgr *session.Manager, owner tools.OwnerFunc, requireConfirmation bool, skillRoots []string) (transport.MessageHandler, transport.LegacySessions, error) {
+	httpMode := cfg.HTTPMode()
+	compatEnabled := cfg.LegacyCompatEnabled()
+
+	// Everything that is not per-connection. start_session fills in Command and
+	// PromptRegex by rendering cfg.Renderer against the values it was called with.
+	baseSession := session.Config{
+		LoginTimeout:    cfg.SSH.LoginTimeout,
+		CommandTimeout:  cfg.SSH.CommandTimeout,
+		RecoveryTimeout: cfg.SSH.RecoveryTimeout,
+		Term:            cfg.SSH.Term,
+		Cols:            cfg.SSH.Cols,
+		Rows:            cfg.SSH.Rows,
+		InitCommands:    cfg.SSH.InitCommands,
+		UseSentinel:     cfg.SSH.UseSentinelValue(),
+		MaxOutputBytes:  cfg.SSH.MaxOutputBytes,
+		TranscriptBytes: cfg.SSH.TranscriptBytes,
+		AllowReconnect:  cfg.SSH.AllowReconnect,
+	}
+
+	resourceRegistry := mcp.NewResourceRegistry()
+	registerSessionsIndex(resourceRegistry, mgr, owner)
+
+	// Optional, and absent entirely unless --skills names something: with no registry the
+	// extension is not declared and skills/list answers -32601, so a server started without
+	// the flag is byte-for-byte the server it was before the flag existed. A directory that
+	// was named and cannot be loaded is fatal — an operator who asked for skills and got a
+	// server silently serving none would find out from a model that did not know something.
+	var skillRegistry *mcp.SkillRegistry
+	if len(skillRoots) > 0 {
+		skillRegistry = mcp.NewSkillRegistry(resourceRegistry)
+		names, err := skills.Load(skillRegistry, skillRoots)
+		if err != nil {
+			return nil, nil, fmt.Errorf("loading skills: %w", err)
+		}
+		logging.Info("serving skills", "count", len(names), "skills", strings.Join(names, ", "))
+	}
+
+	registry := mcp.NewToolRegistry()
+	registry.Register(tools.NewStartSession(mgr, owner, cfg.Renderer, baseSession))
+	registry.Register(tools.NewListSessions(mgr, owner))
+	registry.Register(tools.NewEndSession(mgr, owner))
+	registry.Register(tools.NewRunBash(mgr, owner, requireConfirmation))
+	registry.Register(tools.NewTunePromptRegex(mgr, owner))
+	if mgr.Gated() {
+		// Registered only when a gate exists, so the tool's presence in tools/list is itself
+		// the answer to whether this server can be disabled at all. A permanently-false
+		// check on every deployment would teach a caller to skip it on the ones where it
+		// means something.
+		registry.Register(tools.NewIsDisabledByFlag(mgr))
+	}
+
+	listTTL := int64(listTTLMs)
+	serverCfg := &mcp.ServerConfig{
+		Name:         serverName,
+		Version:      serverVersion,
+		Instructions: instructions(requireConfirmation, cfg.Renderer.Parametric(), mgr.Gated(), httpMode),
+		ListTTLMs:    &listTTL,
+		// Assigning a nil *SkillRegistry is safe: the field is a concrete pointer, not an
+		// interface, so nil here really is "no extension".
+		Skills: skillRegistry,
+		// Lets a client list skill://<name> to find a skill's bundled files. Nothing else
+		// becomes listable by it: the walk is over skill resources only.
+		SkillsDirectoryRead: skillRegistry != nil,
+	}
+	if httpMode {
+		// What a caller is shown — its sessions, their transcripts — depends on who it is,
+		// so an intermediary must never replay one caller's answer to another. The principal
+		// is also what an MRTR confirmation is bound to: an elicitation answered by one
+		// caller cannot be redeemed by a different one.
+		serverCfg.DefaultCacheScope = mcp.CacheScopePrivate
+		serverCfg.PrincipalFromContext = func(ctx context.Context) string {
+			who, _ := authenticatedOwner(ctx)
+			return who
+		}
+	}
+	if compatEnabled {
+		// Feed server/discover, the legacy initialize diagnostic, and -32022 from one
+		// list, so a client is never told three different stories about what this server
+		// speaks.
+		serverCfg.AdvertisedVersions = append([]string{mcp.ProtocolVersion}, compat.LegacyVersions...)
+	}
+	server := mcp.NewServer(registry, resourceRegistry, serverCfg)
+
+	// With more than one caller, change notifications are kept inside the caller they are
+	// about; see callerScope. Nil on stdio, where there is nobody to keep them from and the
+	// broker's plain fan-out is exactly right — every method on it is nil-safe, so the
+	// observers below need not ask which transport they are on.
+	var scope *callerScope
+	if httpMode {
+		scope = newCallerScope(server, owner, mgr)
+	}
+
+	// After NewServer, which is what attaches the registry to the notification broker: a
+	// NotifyUpdated on a detached registry reaches nobody. Sessions are created by tool
+	// calls, which cannot arrive until the transport is serving, so this is comfortably
+	// early enough — but it must precede the first start_session either way, since a
+	// session that joined without it would never announce anything.
+	mgr.SetLifecycleObserver(
+		func(id, sessOwner string, sess *session.Session) {
+			// Registered before the observer is installed, so no notification can be
+			// aimed at a URI the registry does not know yet. Both run before the login
+			// handshake begins, which is what lets a subscriber watch that handshake's
+			// own transitions rather than missing all of them.
+			// Counted before the registration that announces it; see callerScope.indexChanged.
+			scope.catalogChanged(sessOwner)
+			registerSessionResources(resourceRegistry, id, sess, func(ctx context.Context) bool {
+				who, err := owner(ctx)
+				return err == nil && who == sessOwner
+			})
+
+			statusURI := tools.StatusURI(id)
+			sess.SetStatusObserver(func(st session.Status) {
+				// busy/ready is two lines per command and tells an operator nothing; the
+				// states worth waking up for are the ones that need a human or a repair.
+				if st.State == session.StateBusy.String() || st.State == session.StateReady.String() {
+					logging.Debug("session status changed", "session_id", id, "state", st.State, "commands_run", st.CommandsRun)
+				} else {
+					logging.Info("session status changed", "session_id", id, "state", st.State, "last_error", st.LastError)
+				}
+				resourceRegistry.NotifyUpdated(statusURI)
+				scope.indexChanged(sessOwner)
+				// The index carries every session's state, so it changed too. A client
+				// watching the collection rather than one session is the likelier case
+				// now that ids are not known ahead of time.
+				resourceRegistry.NotifyUpdated(tools.SessionsURI)
+			})
+		},
+		func(id, sessOwner string) {
+			scope.catalogChanged(sessOwner)
+			// Unregistering fires resources/list_changed; the session's own final "dead"
+			// update has already gone out, because Manager.End closes before it removes.
+			resourceRegistry.Unregister(tools.StatusURI(id))
+			resourceRegistry.Unregister(tools.TranscriptURI(id))
+			resourceRegistry.NotifyUpdated(tools.SessionsURI)
+		},
+	)
+
+	// Wrap server in the legacy-compat overlay, not the other way around: the overlay
+	// translates a pre-2026-07-28 request into the modern wire shape and forwards it to
+	// server unchanged, so everything above this line (tools, resources, the status
+	// observer) stays oblivious to which era a given caller is on.
+	var handlerInner transport.MessageHandler = server
+	if scope != nil {
+		handlerInner = scope
+	}
+	var legacySessions transport.LegacySessions // HTTP's legacy GET/DELETE; nil unless compat is on
+	if compatEnabled {
+		overlay := compat.New(handlerInner, compat.Config{
+			SessionTTL: cfg.LegacyCompatSessionTTL(),
+			ServerInfo: mcp.Implementation{Name: serverName, Version: serverVersion},
+		})
+		handlerInner = overlay
+		legacySessions = overlay.LegacySessions()
+		logging.Info("legacy MCP compatibility enabled", "advertised_versions", serverCfg.AdvertisedVersions)
+	}
+
+	return handlerInner, legacySessions, nil
 }
 
 // How long the server waits for work to finish once the client has closed stdin.
@@ -374,7 +468,8 @@ func (d *drainingHandler) waitIdle(quiet, grace time.Duration) {
 // only when the transport's context is cancelled — which nothing but Stop does. A client that
 // subscribes and then closes stdin would therefore never trip Done, and this server invites
 // exactly that: every session publishes a status resource whose updates are worth watching.
-// Verified against v0.8.1; the deadlock is real, not theoretical. Keeping the EOF signal
+// Verified against v0.8.1, and the transport is byte-identical in v0.11.1; the deadlock is
+// real, not theoretical. Keeping the EOF signal
 // separate from the drain is what makes stdin EOF prompt regardless of what is parked.
 //
 // What the upgrade did buy is NewStdioTransportWithStreams: the read end is now passed to the
@@ -409,15 +504,22 @@ func watchStdin() (io.Reader, <-chan struct{}) {
 // when nothing is open — that it serves no resources at all. A client that caches
 // capabilities from its first handshake, which every pre-2026-07-28 client does, would
 // never look again.
-func registerSessionsIndex(reg *mcp.ResourceRegistry, mgr *session.Manager) {
+//
+// What it lists depends on who is reading: a caller sees the sessions it opened and no
+// others, the same rule list_sessions applies.
+func registerSessionsIndex(reg *mcp.ResourceRegistry, mgr *session.Manager, owner tools.OwnerFunc) {
 	reg.Register(mcp.Resource{
 		URI:  tools.SessionsURI,
 		Name: "Open Sessions",
-		Description: "Every session currently open on this server: its id, the command that opened it, the parameters it was opened with, and its live state. " +
+		Description: "Every session you currently have open on this server: its id, the command that opened it, the parameters it was opened with, and its live state. " +
 			"The same information the list_sessions tool returns.",
 		MimeType: "application/json",
-	}, func(context.Context) (mcp.ResourceContentResult, error) {
-		b, err := json.MarshalIndent(mgr.List(), "", "  ")
+	}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
+		who, err := owner(ctx)
+		if err != nil {
+			return mcp.ResourceContentResult{}, err
+		}
+		b, err := json.MarshalIndent(mgr.List(who), "", "  ")
 		if err != nil {
 			return mcp.ResourceContentResult{}, err
 		}
@@ -427,13 +529,21 @@ func registerSessionsIndex(reg *mcp.ResourceRegistry, mgr *session.Manager) {
 
 // registerSessionResources publishes one session's status and transcript, under URIs
 // carrying its id. Both are unregistered when the session ends.
-func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *session.Session) {
+//
+// mine reports whether the reader is the caller that opened the session. To anyone else the
+// read answers exactly as an unregistered URI does. The URIs themselves are visible to every
+// caller in resources/list — the registry is one catalog — which is why holding one must
+// confer nothing: a transcript is verbatim terminal output.
+func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *session.Session, mine func(context.Context) bool) {
 	reg.Register(mcp.Resource{
 		URI:         tools.StatusURI(id),
 		Name:        "Session " + id + " Status",
 		Description: "State of session " + id + ": whether it is alive and at a prompt, the command that opened it, the prompt regex in effect, whether sentinel framing is available, and how many commands have run.",
 		MimeType:    "application/json",
-	}, func(context.Context) (mcp.ResourceContentResult, error) {
+	}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
+		if !mine(ctx) {
+			return mcp.ResourceContentResult{}, mcp.ErrResourceNotFound
+		}
 		b, err := json.MarshalIndent(sess.Status(), "", "  ")
 		if err != nil {
 			return mcp.ResourceContentResult{}, err
@@ -447,7 +557,10 @@ func registerSessionResources(reg *mcp.ResourceRegistry, id string, sess *sessio
 		Description: "Recent raw bytes emitted by session " + id + "'s remote shell, escape sequences intact, for diagnosing a prompt regex that does not match. " +
 			"WARNING: this is verbatim terminal output and may contain command output, hostnames, or secrets that were printed to the shell.",
 		MimeType: "text/plain",
-	}, func(context.Context) (mcp.ResourceContentResult, error) {
+	}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
+		if !mine(ctx) {
+			return mcp.ResourceContentResult{}, mcp.ErrResourceNotFound
+		}
 		return mcp.ResourceContentResult{Text: string(sess.Transcript(0))}, nil
 	})
 }
@@ -552,7 +665,7 @@ func vcsInfo(bi *debug.BuildInfo) (revision, when string, dirty bool) {
 	return revision, when, dirty
 }
 
-func instructions(requireConfirmation, parametric, gated bool) string {
+func instructions(requireConfirmation, parametric, gated, shared bool) string {
 	s := "Runs commands on remote hosts through persistent shell sessions. " +
 		"Nothing is connected when this server starts: call start_session to open a session and get its id, pass that id to run_bash for every command, and call end_session when finished. " +
 		"Sessions are capped, and each one is a real privileged login held open on the remote side, so end them rather than abandoning them. "
@@ -562,6 +675,9 @@ func instructions(requireConfirmation, parametric, gated bool) string {
 	s += "A session takes a moment to log in — list_sessions reports each session's state, and only \"ready\" can run commands, though a command sent early fails harmlessly. " +
 		"Each session is one shell running one command at a time, so working directory and exported variables persist across calls on the same id and are independent between ids. " +
 		"If a session reports state \"awaiting_prompt\", or run_bash says the prompt regex has not matched, read that session's transcript resource to see what the shell printed and repair the pattern with tune_prompt_regex."
+	if shared {
+		s += " This server is shared: a session belongs to the conversation that opened it, list_sessions shows only yours, and nobody else can use or see one of yours. The session limit is the whole server's, so start_session can report it reached while you hold none — that clears as other callers finish, so wait rather than retry in a loop."
+	}
 	if requireConfirmation {
 		s += " Every run_bash call requires the caller to confirm the exact command via an elicitation round trip before it executes — clients must declare the elicitation capability."
 	}

@@ -1,9 +1,11 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/spirilis/mcp-linux-over-ssh/session"
 )
@@ -37,16 +39,49 @@ func StatusURI(id string) string { return sessionURIPrefix + id + "/status" }
 // TranscriptURI is where a single session's raw shell output is published.
 func TranscriptURI(id string) string { return sessionURIPrefix + id + "/transcript" }
 
+// OwnerFunc names the caller a request is being made for, as the opaque owner string
+// session.Manager scopes every session by.
+//
+// It exists because the answer depends on the transport and nothing in this package should.
+// Over stdio there is one caller — the process that launched this server — and SingleCaller
+// says so. Over HTTP the caller is whoever the auth middleware attested, and a request that
+// reaches a tool with no attested caller is an error rather than an empty owner: the empty
+// owner is stdio's, and falling back to it would hand an unauthenticated request every
+// session the server holds.
+type OwnerFunc func(ctx context.Context) (string, error)
+
+// SingleCaller is the OwnerFunc for a transport with exactly one implicit caller.
+func SingleCaller(context.Context) (string, error) { return "", nil }
+
+// SessionIDFromURI reports whether uri is one of a session's own resources — its status or
+// its transcript — and if so which session's. The index is not: it belongs to no session.
+func SessionIDFromURI(uri string) (id string, ok bool) {
+	rest, ok := strings.CutPrefix(uri, sessionURIPrefix)
+	if !ok {
+		return "", false
+	}
+	id, leaf, ok := strings.Cut(rest, "/")
+	if !ok || id == "" || (leaf != "status" && leaf != "transcript") {
+		return "", false
+	}
+	return id, true
+}
+
 // resolveSession looks up a session id supplied by a caller.
 //
 // An id that names nothing is an ordinary mistake — a session that was ended, or one from
 // before a restart — so the error names the tool that can list what actually exists rather
-// than leaving the model to guess.
-func resolveSession(mgr *session.Manager, id string) (*session.Session, error) {
+// than leaving the model to guess. A session opened by a different caller gets the same
+// answer, word for word: see session.Manager.Start.
+func resolveSession(ctx context.Context, mgr *session.Manager, owner OwnerFunc, id string) (*session.Session, error) {
 	if id == "" {
 		return nil, fmt.Errorf("session_id is required; call start_session to open a session, or list_sessions to see the ones already open")
 	}
-	sess, ok := mgr.Get(id)
+	who, err := owner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sess, ok := mgr.Get(who, id)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q is not an open session; call list_sessions to see what is open, or start_session to open one", session.ErrNoSuchSession, id)
 	}

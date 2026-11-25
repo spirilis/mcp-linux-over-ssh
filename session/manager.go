@@ -40,8 +40,8 @@ type Manager struct {
 	// gate, when set, can administratively refuse all session activity. See SetGate.
 	gate Gate
 
-	onAdd    func(id string, s *Session)
-	onRemove func(id string)
+	onAdd    func(id, owner string, s *Session)
+	onRemove func(id, owner string)
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -56,8 +56,11 @@ type ref struct {
 }
 
 type entry struct {
-	id        string
-	sess      *Session
+	id   string
+	sess *Session
+	// owner is whoever opened the session; see Manager.Start. Empty on a transport with
+	// a single implicit caller.
+	owner     string
 	params    map[string]string
 	createdAt time.Time
 	lastUsed  time.Time
@@ -98,7 +101,7 @@ func NewManager(max int, idleTimeout time.Duration) *Manager {
 //
 // Neither callback runs under the manager's lock, so both may call back into it. Set them
 // before the first Start.
-func (m *Manager) SetLifecycleObserver(onAdd func(id string, s *Session), onRemove func(id string)) {
+func (m *Manager) SetLifecycleObserver(onAdd func(id, owner string, s *Session), onRemove func(id, owner string)) {
 	m.mu.Lock()
 	m.onAdd, m.onRemove = onAdd, onRemove
 	m.mu.Unlock()
@@ -160,7 +163,16 @@ func (m *Manager) Gated() bool {
 // that gave up on the call while the session it asked for came up anyway, alive and
 // audited, with nobody holding its id. Callers learn readiness from list_sessions or the
 // session's status resource; a command sent too early fails cleanly through checkRunnable.
-func (m *Manager) Start(cfg Config, params map[string]string) (string, error) {
+//
+// owner names whoever is opening the session, and every later Get, End and List is answered
+// only for that same owner. It is an opaque string: the manager compares it and nothing
+// more, which is what keeps it ignorant of MCP and of how a caller was authenticated. A
+// transport with one implicit caller (stdio) passes "" throughout and sees every session,
+// exactly as before ownership existed. To any other owner a session does not exist — the
+// answer is indistinguishable from an id that was never issued, so an id that leaks is not
+// a handle and its existence is not confirmed. The cap, the reaper and the gate are not
+// per-owner: they are properties of the server.
+func (m *Manager) Start(owner string, cfg Config, params map[string]string) (string, error) {
 	// The gate outranks the cap: "an operator has stopped this server" is both the more
 	// accurate explanation and the more actionable one, and reporting a limit instead would
 	// send the caller off to end sessions that are already being torn down. Checked live
@@ -192,44 +204,75 @@ func (m *Manager) Start(cfg Config, params map[string]string) (string, error) {
 
 	now := time.Now()
 	id := m.newIDLocked()
-	m.sessions[id] = &entry{id: id, sess: sess, params: params, createdAt: now, lastUsed: now}
+	m.sessions[id] = &entry{id: id, sess: sess, owner: owner, params: params, createdAt: now, lastUsed: now}
 	m.order = append(m.order, id)
 	onAdd := m.onAdd
 	m.mu.Unlock()
 
 	if onAdd != nil {
-		onAdd(id, sess)
+		onAdd(id, owner, sess)
 	}
 	go sess.Handshake(context.Background())
 
-	logging.Info("session started", "session_id", id, "command", cfg.Command)
+	// The owner is logged because this line is the record of who opened a privileged
+	// login. It is empty on a transport with one implicit caller.
+	logging.Info("session started", "session_id", id, "owner", owner, "command", cfg.Command)
 	return id, nil
 }
 
-// Get returns the session registered under id.
+// Get returns the session registered under id, if owner is the one that opened it.
 //
 // It also marks the session as used. That timestamp is taken when a command is handed the
 // session rather than when the command finishes, so a long-running command looks idle by
 // this clock — which is why the reaper independently refuses to touch a busy session.
-func (m *Manager) Get(id string) (*Session, bool) {
+// A lookup by anyone else is a miss and stamps nothing: a caller probing for someone else's
+// session must not be able to keep it alive past the idle reaper.
+func (m *Manager) Get(owner, id string) (*Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.sessions[id]
-	if !ok {
+	if !ok || e.owner != owner {
 		return nil, false
 	}
 	e.lastUsed = time.Now()
 	return e.sess, true
 }
 
+// Owns reports whether id names a session owner opened. Unlike Get it hands nothing out and
+// does not count as use, so it is the right question for a caller that only needs to know
+// whether something about a session is this owner's business.
+func (m *Manager) Owns(owner, id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.sessions[id]
+	return ok && e.owner == owner
+}
+
 // End closes the session registered under id and removes it, reporting whether one was
-// found.
+// found. Like Get, it finds only what owner opened.
 //
 // A command still in flight on that session is cancelled, not waited for: the PTY closes
 // under it and it returns ErrDead. That is exactly what process shutdown already does to a
 // running command, and it is the plainer reading of the tool's name — a caller asking to
 // end a session is not asking to be blocked by whatever it was doing.
-func (m *Manager) End(id string) bool {
+func (m *Manager) End(owner, id string) bool {
+	m.mu.Lock()
+	e, ok := m.sessions[id]
+	if ok && e.owner != owner {
+		m.mu.Unlock()
+		return false
+	}
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return m.end(id)
+}
+
+// end closes and removes a session regardless of who opened it. It is what the server
+// itself uses — the idle reaper, the administrative gate, shutdown — none of which act on
+// anyone's behalf.
+func (m *Manager) end(id string) bool {
 	m.mu.Lock()
 	e, ok := m.sessions[id]
 	if ok {
@@ -247,18 +290,18 @@ func (m *Manager) End(id string) bool {
 	// disappearance whose reason was never delivered.
 	_ = e.sess.Close()
 	if onRemove != nil {
-		onRemove(id)
+		onRemove(id, e.owner)
 	}
 	logging.Info("session ended", "session_id", id)
 	return true
 }
 
-// List snapshots every session in creation order.
-func (m *Manager) List() []Info {
+// List snapshots every session owner opened, in creation order.
+func (m *Manager) List(owner string) []Info {
 	m.mu.Lock()
 	entries := make([]*entry, 0, len(m.order))
 	for _, id := range m.order {
-		if e, ok := m.sessions[id]; ok {
+		if e, ok := m.sessions[id]; ok && e.owner == owner {
 			entries = append(entries, e)
 		}
 	}
@@ -315,7 +358,7 @@ func (m *Manager) CloseAll() {
 			return
 		}
 		for _, id := range ids {
-			m.End(id)
+			m.end(id)
 		}
 	}
 }
@@ -381,7 +424,7 @@ func (m *Manager) reap() {
 		case <-ticker.C:
 			for _, id := range m.idleCandidates() {
 				logging.Info("closing idle session", "session_id", id, "idle_timeout", m.idleTimeout)
-				m.End(id)
+				m.end(id)
 			}
 		}
 	}
@@ -461,7 +504,7 @@ func (m *Manager) enforceGate(poll time.Duration) {
 			}
 			for _, id := range m.gateCandidates() {
 				logging.Warn("terminating session because session activity is disabled", "session_id", id)
-				m.End(id)
+				m.end(id)
 			}
 		}
 	}

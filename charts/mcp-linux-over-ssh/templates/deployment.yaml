@@ -1,0 +1,216 @@
+{{- include "mcp-linux-over-ssh.validate" . }}
+{{- $p := include "mcp-linux-over-ssh.paths" . | fromYaml -}}
+{{- $scheme := include "mcp-linux-over-ssh.scheme" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-linux-over-ssh.fullname" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+spec:
+  # Always one, replaced rather than rolled. Every open session is a shell held
+  # by this process, so a second pod would not know the session ids the first
+  # handed out, and two pods alive at once would answer the same agent with
+  # two different sets of sessions.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mcp-linux-over-ssh.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcp-linux-over-ssh.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pod when its configuration or its skills change: both are
+        # read once, at startup.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.skills.inject }}
+        checksum/skills: {{ include (print $.Template.BasePath "/skills-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # The server never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - {{ $p.config }}
+            {{- if .Values.skills.inject }}
+            - --skills
+            - {{ $p.skillsInject }}
+            {{- end }}
+            {{- range .Values.skills.configMaps }}
+            - --skills
+            - {{ $p.skillsConfigMaps }}/{{ include "mcp-linux-over-ssh.configMapSkillName" . }}
+            {{- end }}
+          env:
+            - name: HOME
+              value: /home/mcp
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: {{ $scheme }}
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          # Both probes answer from the process alone and carry no credential.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ $scheme }}
+              scheme: {{ $scheme | upper }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ $scheme }}
+              scheme: {{ $scheme | upper }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: {{ $p.config }}
+              subPath: config.yaml
+              readOnly: true
+            - name: issuer-ca
+              mountPath: {{ dir $p.issuerCA }}
+              readOnly: true
+            {{- if .Values.actorJwt.kagentController.caConfigMap.name }}
+            - name: kagent-ca
+              mountPath: {{ dir $p.kagentCA }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            # A directory mount, not subPath: renewed files are then swapped in
+            # place, and the server re-reads them.
+            - name: serving-tls
+              mountPath: {{ $p.tls }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.sshCredentials.existingSecret }}
+            - name: ssh-credentials
+              mountPath: {{ $p.sshDir }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.skills.inject }}
+            - name: skills-inject
+              mountPath: {{ $p.skillsInject }}
+              readOnly: true
+            {{- end }}
+            {{- range $i, $c := .Values.skills.configMaps }}
+            - name: skill-cm-{{ $i }}
+              mountPath: {{ $p.skillsConfigMaps }}/{{ include "mcp-linux-over-ssh.configMapSkillName" $c }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ include "mcp-linux-over-ssh.fullname" . }}
+        - name: issuer-ca
+          {{- if .Values.actorJwt.ca.clusterTrustBundle.enabled }}
+          projected:
+            sources:
+              - clusterTrustBundle:
+                  signerName: {{ .Values.actorJwt.ca.clusterTrustBundle.signerName }}
+                  {{- with .Values.actorJwt.ca.clusterTrustBundle.labelSelector }}
+                  labelSelector:
+                    {{- toYaml . | nindent 20 }}
+                  {{- end }}
+                  path: {{ base $p.issuerCA }}
+          {{- else }}
+          configMap:
+            name: {{ .Values.actorJwt.ca.configMap.name }}
+            items:
+              - key: {{ .Values.actorJwt.ca.configMap.key }}
+                path: {{ base $p.issuerCA }}
+          {{- end }}
+        {{- with .Values.actorJwt.kagentController.caConfigMap }}
+        {{- if .name }}
+        - name: kagent-ca
+          configMap:
+            name: {{ .name }}
+            items:
+              - key: {{ .key }}
+                path: {{ base $p.kagentCA }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: serving-tls
+          {{- if .Values.tls.volume }}
+          {{- toYaml .Values.tls.volume | nindent 10 }}
+          {{- else }}
+          secret:
+            secretName: {{ include "mcp-linux-over-ssh.servingTLSSecretName" . }}
+            items:
+              - key: tls.crt
+                path: {{ .Values.tls.certFile }}
+              - key: tls.key
+                path: {{ .Values.tls.keyFile }}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.sshCredentials.existingSecret }}
+        - name: ssh-credentials
+          secret:
+            secretName: {{ .Values.sshCredentials.existingSecret }}
+            # Root-owned and group-readable; the pod's fsGroup is what lets the
+            # container's uid read them. See sshCredentials in values.yaml.
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.skills.inject }}
+        - name: skills-inject
+          configMap:
+            name: {{ include "mcp-linux-over-ssh.skillsConfigMapName" . }}
+            items:
+              {{- range .Values.skills.inject }}
+              - key: {{ .name }}
+                path: {{ .name }}/SKILL.md
+              {{- end }}
+        {{- end }}
+        {{- range $i, $c := .Values.skills.configMaps }}
+        - name: skill-cm-{{ $i }}
+          configMap:
+            name: {{ $c.name }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

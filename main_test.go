@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"runtime/debug"
@@ -11,6 +12,7 @@ import (
 	"github.com/spirilis/generic-go-mcp/mcp"
 
 	"github.com/spirilis/mcp-linux-over-ssh/session"
+	"github.com/spirilis/mcp-linux-over-ssh/tools"
 )
 
 // The counterpart to tools.TestToolDefinitionsDoNotNameTheTransport, for the protocol text
@@ -26,10 +28,12 @@ func TestInstructionsDoNotNameTheTransport(t *testing.T) {
 	for _, confirm := range []bool{false, true} {
 		for _, parametric := range []bool{false, true} {
 			for _, gated := range []bool{false, true} {
-				s := instructions(confirm, parametric, gated)
-				if strings.Contains(strings.ToLower(s), "ssh") {
-					t.Errorf("instructions(confirm=%v, parametric=%v, gated=%v) names the transport:\n%s",
-						confirm, parametric, gated, s)
+				for _, shared := range []bool{false, true} {
+					s := instructions(confirm, parametric, gated, shared)
+					if strings.Contains(strings.ToLower(s), "ssh") {
+						t.Errorf("instructions(confirm=%v, parametric=%v, gated=%v, shared=%v) names the transport:\n%s",
+							confirm, parametric, gated, shared, s)
+					}
 				}
 			}
 		}
@@ -41,11 +45,11 @@ func TestResourceDescriptionsDoNotNameTheTransport(t *testing.T) {
 	t.Cleanup(mgr.CloseAll)
 
 	reg := mcp.NewResourceRegistry()
-	registerSessionsIndex(reg, mgr)
+	registerSessionsIndex(reg, mgr, tools.SingleCaller)
 	// A nil session is safe here: Register only stores the read callback, and nothing in
 	// this test invokes it. The descriptions are built eagerly, which is all that is under
 	// test.
-	registerSessionResources(reg, "s-abcd1234", nil)
+	registerSessionResources(reg, "s-abcd1234", nil, func(context.Context) bool { return true })
 
 	listed := reg.List()
 	if len(listed) != 3 {
@@ -243,5 +247,19 @@ func TestWatchStdinReportsEOFWithoutTouchingTheGlobal(t *testing.T) {
 	// rather than parking on a pipe nothing will ever write to again.
 	if _, err := io.ReadAll(stream); err != nil {
 		t.Errorf("reading the stream after EOF: %v", err)
+	}
+}
+
+// The chart's appVersion is the image tag it deploys, and the image reports serverVersion.
+// A chart naming a version whose image predates a feature it configures is a crash-looping
+// pod, so the two are bumped together or this fails.
+func TestChartAppVersionMatchesTheServer(t *testing.T) {
+	b, err := os.ReadFile("charts/mcp-linux-over-ssh/Chart.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `appVersion: "` + serverVersion + `"`
+	if !strings.Contains(string(b), want) {
+		t.Errorf("charts/mcp-linux-over-ssh/Chart.yaml does not say %s", want)
 	}
 }
