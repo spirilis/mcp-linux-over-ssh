@@ -61,3 +61,23 @@ pattern against *this* codebase's concurrency, and prove it with a throwaway pro
 than reasoning about it. The check cost about five minutes; shipping it would have been a
 hang in production with privileged sessions held open. Also: adopting part of a new API is a
 legitimate outcome — `Done()` was still worth using after `Stop()`, just not as the trigger.
+
+## A release tag goes on main, after the merge (2026-11-25)
+
+Asked to tag the tool so `go install` would build it, I tagged `v0.5.0` on the feature branch
+I had pushed the work to, and pushed the tag, before anything had been merged. The user
+stopped me: merge to main first, then tag.
+
+It came out right only by luck of the shape — main fast-forwarded to the same commit, so the
+tag did not have to move. Had main needed a merge commit, the tag would have named a commit
+that is not the release, and a pushed version tag is effectively permanent: the Go module
+proxy caches what a version resolves to the first time anyone asks.
+
+**Why I got it wrong:** I reasoned that a tag works from any branch (true) and stopped
+there, and I had created the branch on my own initiative in the first place, in a repository
+whose every release is a commit on main.
+
+**Apply as:** before tagging, get the commit onto main and tag what main points at. When a
+request to release arrives while work sits on a branch, the merge is part of the request —
+do it first, or ask, but do not tag around it. More generally, order irreversible steps
+last, and treat "push a version tag" as one.
