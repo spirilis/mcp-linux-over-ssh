@@ -176,8 +176,12 @@ See the end of `config.yaml.example` for every key.
 ### Kubernetes
 
 ```
-./build-docker-multi.sh 0.5.0        # linux/amd64 + linux/arm64, cross-compiled
-helm install bastion ./charts/mcp-linux-over-ssh -n kagent -f my-values.yaml
+# Builds linux/amd64 + linux/arm64 (cross-compiled) and pushes the image, tagged with the
+# chart's appVersion and :latest, then packages and pushes the chart. PUSH=0 does neither push.
+REGISTRY=my-registry.tld ./deploy-assets-oci.sh
+
+helm install bastion oci://my-registry.tld/helm/mcp-linux-over-ssh -n kagent -f my-values.yaml
+# or, from a checkout: helm install bastion ./charts/mcp-linux-over-ssh -n kagent -f my-values.yaml
 ```
 
 A minimal `my-values.yaml`:

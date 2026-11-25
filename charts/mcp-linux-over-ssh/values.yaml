@@ -6,7 +6,7 @@
 # uses the Recreate strategy.
 
 image:
-  # Built by ../../build-docker-multi.sh (linux/amd64 + linux/arm64).
+  # Built by ../../deploy-assets-oci.sh (linux/amd64 + linux/arm64).
   repository: my-registry.tld/library/mcp-linux-over-ssh
   # Defaults to the chart appVersion when empty.
   tag: ""

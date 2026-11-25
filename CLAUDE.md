@@ -31,8 +31,11 @@ go test ./session/ -run TestSessionRecoversFromTimeout -v
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
   | ./mcp-linux-over-ssh --config config.yaml
 
-# Multi-platform image (Go cross-compiled, never emulated). PUSH=0 builds without pushing.
-./build-docker-multi.sh [tag]
+# Multi-platform image (Go cross-compiled, never emulated) AND the chart, both pushed to
+# ${REGISTRY}: the image as :<appVersion> and :latest, the chart to oci://${REGISTRY}/helm.
+# The tag is read from the chart's appVersion; there is no tag argument. It refuses to run
+# if main.go's serverVersion disagrees. PUSH=0 builds and packages without pushing.
+REGISTRY=my-registry.tld ./deploy-assets-oci.sh
 
 # The chart. config/chart_test.go renders it with helm (skipped where helm is absent) and
 # feeds what it renders to this binary's own loaders, so `go test ./config/` covers it.
