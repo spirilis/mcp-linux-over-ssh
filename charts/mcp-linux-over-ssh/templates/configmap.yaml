@@ -28,6 +28,15 @@ data:
       cert_file: {{ $p.tls }}/{{ .Values.tls.certFile }}
       key_file: {{ $p.tls }}/{{ .Values.tls.keyFile }}
     {{- end }}
+    {{- with .Values.staticTokens }}
+    static_tokens:
+      {{- range . }}
+      - name: {{ .name | quote }}
+        token_file: {{ $p.staticTokens }}/{{ .name }}
+        discover_only: {{ .discoverOnly | default false }}
+      {{- end }}
+    {{- end }}
+    {{- if include "mcp-linux-over-ssh.actorJwtEnabled" . }}
     actor_jwt:
       enabled: true
       issuer: {{ .Values.actorJwt.issuer | quote }}
@@ -40,5 +49,6 @@ data:
         {{- if .Values.actorJwt.kagentController.caConfigMap.name }}
         ca_file: {{ $p.kagentCA }}
         {{- end }}
+    {{- end }}
     ssh:
       {{- toYaml .Values.ssh | nindent 6 }}

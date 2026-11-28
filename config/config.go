@@ -1,8 +1,8 @@
 // Package config loads mcp-linux-over-ssh's configuration.
 //
 // The same YAML file feeds two parsers: generic-go-mcp's own config.Load reads the
-// server: and logging: blocks, and this package reads the ssh: block, the actor_jwt: and
-// tls: blocks that only matter in http mode (see http.go), plus a couple of fields the
+// server: and logging: blocks, and this package reads the ssh: block, the actor_jwt:,
+// static_tokens: and tls: blocks that only matter in http mode (see http.go), plus a couple of fields the
 // library's logging: block doesn't have room for (see LoggingConfig). The
 // library's config.Config has no extension point, so a second unmarshal of the same file
 // is the least surprising way to carry our own settings.
@@ -118,9 +118,10 @@ type Config struct {
 	SSH     SSHConfig
 	Logging LoggingConfig
 
-	// ActorJWT admits kagent agents by their Substrate actor JWT. Required in http mode,
-	// rejected in stdio mode.
-	ActorJWT *ActorJWTConfig
+	// ActorJWT admits kagent agents by their Substrate actor JWT. StaticTokens admit callers
+	// by a fixed bearer token. http mode needs at least one of the two; stdio rejects both.
+	ActorJWT     *ActorJWTConfig
+	StaticTokens []StaticTokenConfig
 	// TLS makes the HTTP listener serve HTTPS itself. http mode only.
 	TLS *TLSConfig
 
@@ -131,10 +132,11 @@ type Config struct {
 }
 
 type fileEnvelope struct {
-	SSH      SSHConfig       `yaml:"ssh"`
-	Logging  LoggingConfig   `yaml:"logging"`
-	ActorJWT *ActorJWTConfig `yaml:"actor_jwt"`
-	TLS      *TLSConfig      `yaml:"tls"`
+	SSH          SSHConfig           `yaml:"ssh"`
+	Logging      LoggingConfig       `yaml:"logging"`
+	ActorJWT     *ActorJWTConfig     `yaml:"actor_jwt"`
+	StaticTokens []StaticTokenConfig `yaml:"static_tokens"`
+	TLS          *TLSConfig          `yaml:"tls"`
 }
 
 // Defaults applied to any field the file leaves unset.
@@ -188,10 +190,11 @@ func Load(path string) (*Config, error) {
 
 	var env fileEnvelope
 	if err := yaml.Unmarshal(data, &env); err != nil {
-		return nil, fmt.Errorf("failed to parse ssh config: %w", err)
+		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging, ActorJWT: env.ActorJWT, TLS: env.TLS}
+	cfg := &Config{Lib: lib, SSH: env.SSH, Logging: env.Logging, ActorJWT: env.ActorJWT,
+		StaticTokens: env.StaticTokens, TLS: env.TLS}
 	if err := cfg.SSH.applyDefaults(); err != nil {
 		return nil, err
 	}

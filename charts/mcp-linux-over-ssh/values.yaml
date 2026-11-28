@@ -48,7 +48,7 @@ ssh:
   # Matches the remote shell's prompt. Also a template.
   prompt_regex: ""
   # Required over HTTP, and must be greater than zero: nothing else ends a
-  # session whose agent has gone away.
+  # session whose caller has gone away.
   idle_timeout: 30m
   max_sessions: 8
   # Example: the caller picks the host, the operator fixes everything else.
@@ -77,12 +77,33 @@ ssh:
 sshCredentials:
   existingSecret: ""
 
-# --- Authentication: kagent agents, by Substrate actor JWT --------------------
-# Always on. This server does not answer /mcp anonymously, and has no other way
-# to authenticate a caller. Tokens are verified against THIS cluster's
-# Substrate issuer only, over TLS pinned to the local servicedns CA bundle;
-# agents of other clusters cannot be admitted.
+# --- Authentication ----------------------------------------------------------
+# This server never answers /mcp anonymously: staticTokens, actorJwt, or both.
+# A render with neither fails.
+
+# Static bearer tokens, for curl, scripts, CI and catalog UIs. Checked before
+# actor JWTs. Each token lives in a Secret and is mounted by subPath, so a
+# rotated token takes effect when the pod restarts. Name an existingSecret (the
+# token under `key`, default `token`) or give it inline as `token` (the chart
+# then creates the Secret; pass it with --set-string, never from a committed
+# file). At least 32 characters: openssl rand -hex 32.
+#
+# A token is one caller: everyone holding it shares the sessions it opens, and
+# can use, read and end them. Give each script or service its own token.
+#   - name: ci                    # lowercase; principal static:<name>
+#     existingSecret: ssh-mcp-ci-token
+#     key: token
+#   - name: kagent-ui
+#     token: ""                   # inline
+#     discoverOnly: true          # may list tools, resources and skills; nothing else
+staticTokens: []
+
+# kagent agents, by their Substrate actor JWT. Tokens are verified against THIS
+# cluster's Substrate issuer only, over TLS pinned to the local servicedns CA
+# bundle; agents of other clusters cannot be admitted. Turn it off only for a
+# deployment that serves staticTokens alone.
 actorJwt:
+  enabled: true
   issuer: https://idp.ate-system.svc
   # Defaults to <scheme>://<fullname>.<namespace>.svc.cluster.local (https with
   # tls.enabled). Must equal an entry of the RemoteMCPServer's

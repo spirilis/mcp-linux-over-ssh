@@ -63,31 +63,52 @@ func newHTTPHandler(a *authn.Authenticator, mcpHandler transport.MessageHandler,
 	return mux, trans, nil
 }
 
-// buildAuthenticator assembles actor JWT authentication from the config. ctx bounds the
-// verifier's background issuer discovery and key refresh.
+// buildAuthenticator assembles authentication from the config: static tokens, actor JWTs, or
+// both. ctx bounds the verifier's background issuer discovery and key refresh.
 func buildAuthenticator(ctx context.Context, cfg *config.Config, log *slog.Logger) (*authn.Authenticator, func(), error) {
-	a := cfg.ActorJWT
-	verifier, err := authn.NewActorVerifier(ctx, authn.ActorJWTConfig{Issuer: a.Issuer, Audience: a.Audience, CAFile: a.CAFile}, log)
+	read, err := cfg.ReadStaticTokens()
 	if err != nil {
 		return nil, nil, err
 	}
-	resolver, err := authn.NewKagentResolver(authn.KagentResolverConfig{
-		Address: a.KagentController.Address, TLS: a.KagentController.TLS, CAFile: a.KagentController.CAFile,
-	})
+	opts := authn.Options{Realm: serverName, Logger: log}
+	for _, t := range read {
+		opts.StaticTokens = append(opts.StaticTokens, authn.StaticToken{Name: t.Name, Value: t.Value, DiscoverOnly: t.DiscoverOnly})
+	}
+
+	closeAuth := func() {}
+	if cfg.ActorJWTEnabled() {
+		a := cfg.ActorJWT
+		if opts.Verifier, err = authn.NewActorVerifier(ctx, authn.ActorJWTConfig{Issuer: a.Issuer, Audience: a.Audience, CAFile: a.CAFile}, log); err != nil {
+			return nil, nil, err
+		}
+		resolver, err := authn.NewKagentResolver(authn.KagentResolverConfig{
+			Address: a.KagentController.Address, TLS: a.KagentController.TLS, CAFile: a.KagentController.CAFile,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		opts.Resolver, opts.AllowedAgents = resolver, a.AllowedAgents
+		closeAuth = func() { _ = resolver.Close() }
+	}
+
+	auth, err := authn.New(opts)
 	if err != nil {
+		closeAuth()
 		return nil, nil, err
 	}
-	auth, err := authn.New(authn.Options{
-		Verifier: verifier, Resolver: resolver, AllowedAgents: a.AllowedAgents,
-		Realm: serverName, Logger: log,
-	})
-	if err != nil {
-		_ = resolver.Close()
-		return nil, nil, err
+	for _, t := range read {
+		scope := "full"
+		if t.DiscoverOnly {
+			scope = "discover"
+		}
+		log.Info("static token enabled", "name", t.Name, "principal", "static:"+t.Name, "scope", scope)
 	}
-	log.Info("actor JWT authentication enabled", "issuer", a.Issuer, "audience", a.Audience,
-		"kagent_controller", a.KagentController.Address, "allowed_agents", len(a.AllowedAgents))
-	return auth, func() { _ = resolver.Close() }, nil
+	if cfg.ActorJWTEnabled() {
+		a := cfg.ActorJWT
+		log.Info("actor JWT authentication enabled", "issuer", a.Issuer, "audience", a.Audience,
+			"kagent_controller", a.KagentController.Address, "allowed_agents", len(a.AllowedAgents))
+	}
+	return auth, closeAuth, nil
 }
 
 // slogLogger mirrors the logging: section for the authn package, which logs through log/slog
@@ -168,6 +189,8 @@ func serveHTTP(cfg *config.Config, mgr *session.Manager, handler transport.Messa
 		"max_sessions", cfg.SSH.MaxSessions,
 		"idle_timeout", cfg.SSH.IdleTimeout,
 		"parameters", len(cfg.Renderer.Parameters()),
+		"actor_jwt", cfg.ActorJWTEnabled(),
+		"static_tokens", len(cfg.StaticTokens),
 		"probes", "/healthz /readyz")
 
 	<-ctx.Done()

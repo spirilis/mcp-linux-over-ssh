@@ -1,27 +1,33 @@
 // Package authn authenticates MCP callers on the HTTP transport. It satisfies generic-go-mcp's
-// transport.AuthProvider and accepts exactly one credential: a Substrate actor JWT, which the
-// atenet egress gateway injects for a kagent RemoteMCPServer with spec.actorJwt. The token is
-// verified against this cluster's own Substrate issuer (TLS to it pinned to the local
-// servicedns CA bundle), resolved to its kagent Agent through the local kagent controller,
-// and checked against an allowlist.
+// transport.AuthProvider and accepts two credentials, checked in this order:
 //
-// There is deliberately no anonymous mode, no static token and no OAuth: New refuses to build
-// an Authenticator that could admit a request it cannot attribute to an Agent. What sits
-// behind this server is a privileged shell, and "who ran that" has to have an answer.
+//  1. a static bearer token, named in the config and read from a file (for curl, scripts,
+//     CI). The caller is the token's name. A token may be discover-only: it lists the catalog
+//     and nothing else.
+//  2. a Substrate actor JWT, which the atenet egress gateway injects for a kagent
+//     RemoteMCPServer with spec.actorJwt. The token is verified against this cluster's own
+//     Substrate issuer (TLS to it pinned to the local servicedns CA bundle), resolved to its
+//     kagent Agent through the local kagent controller, and checked against an allowlist.
+//
+// There is deliberately no anonymous mode and no OAuth: New refuses to build an
+// Authenticator with no credential configured, so every admitted request is attributed to a
+// token name or an Agent. What sits behind this server is a privileged shell, and "who ran
+// that" has to have an answer.
 //
 // Adapted from mcp-kube-baker's internal/authn, itself from eric-small-mcps
-// youtube-mcp/internal/authn, without OAuth, additional issuers, static tokens or
-// discover-only credentials.
+// youtube-mcp/internal/authn, without OAuth, additional issuers or discover-only agents.
 package authn
 
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -32,15 +38,19 @@ type Kind string
 
 // Principal kinds.
 const (
-	KindAgent Kind = "agent"
+	KindAgent  Kind = "agent"
+	KindStatic Kind = "static"
 )
 
 // Principal is the authenticated caller.
 type Principal struct {
-	// ID is stable per Agent: "agent:<ns>/<name>".
-	ID    string
-	Kind  Kind
+	// ID is stable per caller: "agent:<ns>/<name>" or "static:<name>".
+	ID   string
+	Kind Kind
+	// Login is the agent's "namespace/name" or the static token's name.
 	Login string
+	// Scope is what the caller may do. The zero value grants nothing.
+	Scope Scope
 	// SessionID is the kagent session for agent principals.
 	SessionID string
 	// Actor ("atespace/actorName") and ActorUID are the Substrate actor the token was issued
@@ -62,7 +72,14 @@ type Principal struct {
 // ever report none, the owner falls back to the actor — the sandbox the token was issued
 // to, which is one per conversation and comes from the verified token itself — rather than
 // silently widening to everything the Agent has open.
+//
+// A static token has no conversation to narrow it: the token is the caller, so everyone
+// holding one token shares its sessions, and two tokens never do. That is the reason to give
+// each script or service its own token.
 func (p Principal) Owner() string {
+	if p.Kind == KindStatic {
+		return p.ID
+	}
 	if p.SessionID != "" {
 		return p.ID + "#session:" + p.SessionID
 	}
@@ -82,9 +99,12 @@ func PrincipalFrom(ctx context.Context) (Principal, bool) {
 	return p, ok
 }
 
-// Options configures New.
+// Options configures New. At least one credential must be configured: static tokens, or
+// actor JWTs (Verifier and Resolver, always together).
 type Options struct {
-	// Verifier and Resolver are both required.
+	// StaticTokens are bearer tokens compared in constant time, checked first.
+	StaticTokens []StaticToken
+	// Verifier and Resolver enable actor JWTs. Neither works without the other.
 	Verifier *ActorVerifier
 	Resolver AgentResolver
 	// AllowedAgents lists "namespace/name" patterns; either half may be a glob ("research/*",
@@ -95,8 +115,29 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// StaticToken is one named bearer token.
+type StaticToken struct {
+	Name  string
+	Value string
+	// DiscoverOnly limits the token to listing the catalog.
+	DiscoverOnly bool
+}
+
+// MinStaticTokenLen is the shortest static token accepted: 32 characters of `openssl rand
+// -hex 32` or `-base64 32` output and up.
+const MinStaticTokenLen = 32
+
+var staticNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9_.]{0,61}[a-z0-9])?$`)
+
+type staticEntry struct {
+	name  string
+	sum   [32]byte
+	scope Scope
+}
+
 // Authenticator is the composite authenticator.
 type Authenticator struct {
+	static   []staticEntry
 	verifier *ActorVerifier
 	resolver AgentResolver
 	allowed  []agentPattern
@@ -135,10 +176,22 @@ func New(opts Options) (*Authenticator, error) {
 	if a.realm == "" {
 		a.realm = "mcp"
 	}
-	if a.verifier == nil || a.resolver == nil {
-		return nil, errors.New("actor JWT auth needs both a verifier and an agent resolver: this server has no other way to authenticate a caller")
+	if (a.verifier == nil) != (a.resolver == nil) {
+		return nil, errors.New("actor JWT auth needs both a verifier and an agent resolver")
 	}
 	var err error
+	if a.static, err = parseStaticTokens(opts.StaticTokens); err != nil {
+		return nil, err
+	}
+	if a.verifier == nil && len(a.static) == 0 {
+		return nil, errors.New("no authentication configured: enable actor_jwt or static_tokens; this server does not serve HTTP anonymously")
+	}
+	if a.verifier == nil {
+		if len(opts.AllowedAgents) > 0 {
+			return nil, errors.New("allowed agents are listed but actor JWT auth is off")
+		}
+		return a, nil
+	}
 	if a.allowed, err = parseAgentPatterns(opts.AllowedAgents); err != nil {
 		return nil, err
 	}
@@ -148,14 +201,71 @@ func New(opts Options) (*Authenticator, error) {
 	return a, nil
 }
 
-// Middleware admits authenticated requests and stores their Principal in the context. Every
-// other request is answered here, before any JSON-RPC parsing: there is no path through it
-// that reaches next without a Principal.
+// parseStaticTokens checks the static tokens and keeps only their digests.
+func parseStaticTokens(tokens []StaticToken) ([]staticEntry, error) {
+	var out []staticEntry
+	names := map[string]bool{}
+	for _, t := range tokens {
+		switch {
+		case !staticNameRE.MatchString(t.Name):
+			return nil, fmt.Errorf("static token name %q must be lowercase letters, digits, '-', '_' or '.', at most 63", t.Name)
+		case names[t.Name]:
+			return nil, fmt.Errorf("static token %q is listed twice", t.Name)
+		case len(t.Value) < MinStaticTokenLen:
+			return nil, fmt.Errorf("static token %q must be at least %d characters (openssl rand -hex 32)", t.Name, MinStaticTokenLen)
+		case strings.Count(t.Value, ".") == 2:
+			// A captured actor JWT pasted here would become a credential that never expires.
+			return nil, fmt.Errorf("static token %q looks like a JWT; use a random string (openssl rand -hex 32)", t.Name)
+		}
+		names[t.Name] = true
+		e := staticEntry{name: t.Name, sum: sha256.Sum256([]byte(t.Value)), scope: ScopeFull}
+		if t.DiscoverOnly {
+			e.scope = ScopeDiscover
+		}
+		for _, other := range out {
+			if other.sum == e.sum {
+				// Sessions belong to the token's name; one value, one name.
+				return nil, fmt.Errorf("static tokens %q and %q have the same value", other.name, t.Name)
+			}
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// matchStatic compares token with every static token in constant time.
+func (a *Authenticator) matchStatic(token string) (staticEntry, bool) {
+	sum := sha256.Sum256([]byte(token))
+	found := -1
+	for i := range a.static {
+		if subtle.ConstantTimeCompare(sum[:], a.static[i].sum[:]) == 1 {
+			found = i
+		}
+	}
+	if found < 0 {
+		return staticEntry{}, false
+	}
+	return a.static[found], true
+}
+
+// Middleware admits authenticated requests, stores their Principal in the context, and
+// enforces its Scope. Every other request is answered here, before any JSON-RPC parsing:
+// there is no path through it that reaches next without a Principal.
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
+	next = a.gate(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, hasBearer := bearer(r)
 		if !hasBearer {
 			a.unauthorized(w, "missing bearer token")
+			return
+		}
+		if e, ok := a.matchStatic(token); ok {
+			p := Principal{ID: "static:" + e.name, Kind: KindStatic, Login: e.name, Scope: e.scope}
+			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), p)))
+			return
+		}
+		if a.verifier == nil {
+			a.unauthorized(w, "invalid token")
 			return
 		}
 		p, err := a.authenticateAgent(r.Context(), token)
@@ -203,7 +313,7 @@ func (a *Authenticator) authenticateAgent(ctx context.Context, token string) (Pr
 		return Principal{}, fmt.Errorf("%w: %s", errNotAllowed, agent)
 	}
 	p := Principal{ID: "agent:" + agent, Kind: KindAgent, Login: agent, SessionID: id.SessionID,
-		Actor: actor.Atespace + "/" + actor.ActorName, ActorUID: actor.ActorUID}
+		Actor: actor.Atespace + "/" + actor.ActorName, ActorUID: actor.ActorUID, Scope: ScopeFull}
 	a.log.Debug("actor JWT accepted", "agent", agent, "session", id.SessionID, "expires", exp.Format(time.RFC3339))
 
 	a.mu.Lock()

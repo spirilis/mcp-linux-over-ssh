@@ -32,8 +32,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/spf13/pflag v1.0.10 h1:4EBh2KAYBwaONj6b2Ye1GiHfwjqyROoF4RwYO+vPwFk=
 github.com/spf13/pflag v1.0.10/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
-github.com/spirilis/generic-go-mcp v0.11.1 h1:OopafjfWzpytLbVyUISqh64PhYTWUmMHJ7YB2HOfde4=
-github.com/spirilis/generic-go-mcp v0.11.1/go.mod h1:0XPd/BG0JSiMdaMchWGk0lgHsNg6842+vZUjfTLhtCE=
+github.com/spirilis/generic-go-mcp v0.12.0 h1:stBSZPU6VCpJsBhWR8EaCeF++jkUlLfKijYZtdux2CA=
+github.com/spirilis/generic-go-mcp v0.12.0/go.mod h1:0XPd/BG0JSiMdaMchWGk0lgHsNg6842+vZUjfTLhtCE=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/testify v1.6.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=

@@ -45,7 +45,8 @@ EXPOSE 8080
 #
 # Two ways to run it, chosen by server.mode in the config:
 #   stdio  attached to the MCP client that launched it (docker run -i --rm), never detached.
-#   http   a long-running service for kagent agents; see charts/mcp-linux-over-ssh. It needs
+#   http   a long-running service for kagent agents and static-token callers; see
+#          charts/mcp-linux-over-ssh. It needs
 #          nothing writable but /tmp, so it runs with a read-only root filesystem.
 ENTRYPOINT ["/usr/local/bin/mcp-linux-over-ssh"]
 CMD ["--config", "/etc/mcp-linux-over-ssh/config.yaml"]

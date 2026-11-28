@@ -1,7 +1,8 @@
 # mcp-linux-over-ssh configuration.
 #
 # This one file feeds two parsers: generic-go-mcp reads server: and logging:, and this
-# server reads ssh:, plus actor_jwt: and tls: when server.mode is http (see the end).
+# server reads ssh:, plus static_tokens:, actor_jwt: and tls: when server.mode is http
+# (see the end).
 #
 # Nothing connects when this server starts. The ssh: block below is a template for the
 # sessions an MCP client opens on demand with the start_session tool; several can be live
@@ -9,9 +10,9 @@
 
 server:
   # stdio: launched by an MCP client, which is the only caller. The default.
-  # http:  a network service for kagent agents. Never anonymous — it requires the
-  #        actor_jwt: block at the end of this file and will not start without it — and
-  #        requires ssh.idle_timeout below.
+  # http:  a network service for kagent agents and scripts. Never anonymous — it requires
+  #        static_tokens:, actor_jwt:, or both (at the end of this file) and will not start
+  #        without one — and requires ssh.idle_timeout below.
   mode: stdio
 
   # http mode only. Defaults shown.
@@ -195,15 +196,29 @@ ssh:
 # Everything below applies to server.mode: http only, and is rejected in stdio mode.
 # ---------------------------------------------------------------------------------------
 
-# Who may call. The HTTP transport accepts exactly one credential: the Substrate actor JWT
-# that kagent's egress gateway attaches for a RemoteMCPServer with spec.actorJwt. There is
-# no anonymous access, no static token and no OAuth; an `auth:` block is a startup error
-# rather than something silently ignored.
+# Who may call. The HTTP transport accepts two credentials: static bearer tokens, checked
+# first, and the Substrate actor JWT that kagent's egress gateway attaches for a
+# RemoteMCPServer with spec.actorJwt. At least one must be configured. There is no
+# anonymous access and no OAuth; an `auth:` block is a startup error rather than something
+# silently ignored.
 #
-# A token is verified against this cluster's issuer, resolved to the kagent Agent it
-# belongs to, and that Agent is checked against allowed_agents. Sessions then belong to the
-# Agent *and* the conversation that opened them: one caller cannot list, use, read or end
-# another's.
+# Static tokens, for curl, scripts, CI and catalog UIs. Each token is read from its own
+# file at start (surrounding whitespace trimmed), never written here; at least 32
+# characters (openssl rand -hex 32), and not JWT-shaped. The caller is static:<name>, and
+# everyone holding one token is one caller: they share the sessions it opens. Give each
+# script its own token. discover_only: true lets a token list tools, resources and skills
+# and nothing else (a catalog UI).
+# static_tokens:
+#   - name: ci
+#     token_file: /etc/mcp-linux-over-ssh/static-tokens/ci
+#   - name: kagent-ui
+#     token_file: /etc/mcp-linux-over-ssh/static-tokens/kagent-ui
+#     discover_only: true
+#
+# Actor JWTs. A token is verified against this cluster's issuer, resolved to the kagent
+# Agent it belongs to, and that Agent is checked against allowed_agents. Sessions then
+# belong to the Agent *and* the conversation that opened them: one caller cannot list, use,
+# read or end another's.
 # actor_jwt:
 #   enabled: true
 #   # This cluster's Substrate issuer. Default shown.

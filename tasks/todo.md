@@ -626,3 +626,55 @@ and ship a Dockerfile and Helm chart with Gateway API, cert-manager and optional
   dropped: `start_session` reaches `ready`, `run_bash` returns exit 0, `ssh` is on the path.
 - **Not verified:** a real actor JWT from a real Substrate issuer, the kagent controller
   lookup against a real controller, or a real pod. The auth path is tested against fakes.
+
+## Upgrade to generic-go-mcp v0.12.0, and static tokens (2026-11-27)
+
+Goal: take v0.12.0 (as kube-baker and genome-vcf-mcp did), and add app-side static bearer
+tokens with discover-only, ported from mcp-kube-baker. No OAuth: an `auth:` block stays a
+startup error.
+
+- [x] **The upgrade is drop-in.** `go get` v0.12.0, `go mod tidy`; build, vet and the race
+      suite pass untouched. v0.12.0 is OAuth providers/rules/roles; none of it is linked.
+- [x] **The one change that reaches this server:** `tools/call` refuses `inputResponses`
+      without the `requestState` that asked for them. Against v0.11.1 a pre-confirmed
+      `run_bash` executed its command, skipping `require_confirmation`.
+      `TestRunBashCannotBePreConfirmed` pins it (fails on v0.11.1, verified) and drives the
+      real round trip too.
+- [x] **Static tokens** (`static_tokens: [{name, token_file, discover_only}]`): checked first,
+      SHA-256 digests in constant time; ≥32 chars, not JWT-shaped, unique names and values.
+      Either credential alone is enough for http mode; the three "never anonymous" locks
+      (`validateTransport`, `authn.New`, `newHTTPHandler`) now mean "actor JWT or static
+      tokens". `buildAuthenticator` builds no verifier/resolver when `actor_jwt` is off.
+- [x] **Ownership:** a static token's owner is `static:<name>`. Every holder shares its
+      sessions, two tokens never do. `TestHTTPStaticTokenSessions`; static callers added as
+      outsiders to `TestHTTPSessionsBelongToTheirCaller` and
+      `TestHTTPNotificationsStayWithTheirOwner`.
+- [x] **Discover-only:** `authn/scope.go` from kube-baker (with `skills/list`). Every principal
+      has a Scope; agents get full. `TestHTTPDiscoverOnlyToken` on the assembled stack, both
+      eras: start_session, list_sessions, run_bash, resources/read, subscriptions/listen all
+      403 / -32003, and no session opened. Mutation: removing the gate fails it and the authn
+      tests.
+- [x] **Chart:** `actorJwt.enabled` (default true, so existing values render unchanged);
+      `staticTokens[]` in kube-baker's shape, subPath mounts, managed Secret for inline
+      tokens with a checksum; the render fails with neither credential.
+      `TestChartStaticTokens` loads the rendered config and starts authn on it.
+- [x] Docs: CLAUDE.md (HTTP mode, ownership, chart, v0.12.0 notes, skill reference), README,
+      config.yaml.example, `--help-config`, NOTES.
+- [x] Versions: app 0.5.1, chart 0.1.1.
+
+### Review
+
+Verified: `go vet`, `go test ./... -race`, `helm lint` (defaults; static only), client
+dry-run NOTES both ways. Real binary on `config.yaml.example` switched to http with its
+static_tokens block uncommented: the full token lists tools and opens a session; the
+discover-only token lists, and `tools/call` gets 403 / -32003 with a WARN naming it; a
+wrong token and no token get 401; startup logs each token and its scope.
+
+After review: a `static_tokens` entry with an unknown key (e.g. the chart's `discoverOnly`
+spelling) loaded as a full-scope token; now a startup error. `actorJwt.enabled` counts as on
+unless explicitly false, so `--reuse-values` from chart 0.1.0 keeps agents. A discover-only
+token's legacy GET stream is pinned silent in `TestHTTPNotificationsStayWithTheirOwner`.
+
+Not done: discover-only *agents* (an actor_jwt allowlist entry granting only listing);
+kagent cannot present a discover-only token yet. `resources/list` shows a discover-only
+token every live session's URI (inert ids, as for any caller). No image built; no tag.

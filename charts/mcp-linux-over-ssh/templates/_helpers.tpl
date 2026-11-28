@@ -69,6 +69,29 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-skills" (include "mcp-linux-over-ssh.fullname" .) -}}
 {{- end }}
 
+{{/*
+"true" unless actorJwt.enabled is explicitly false. An absent key counts as on, so
+`helm upgrade --reuse-values` from a chart that had no such key keeps admitting agents.
+*/}}
+{{- define "mcp-linux-over-ssh.actorJwtEnabled" -}}
+{{- if ne (toString .Values.actorJwt.enabled) "false" }}true{{ end -}}
+{{- end }}
+
+{{- define "mcp-linux-over-ssh.staticTokensSecretName" -}}
+{{- printf "%s-static-tokens" (include "mcp-linux-over-ssh.fullname" .) -}}
+{{- end }}
+
+{{/* True when some static token is given inline, so the chart creates its Secret. */}}
+{{- define "mcp-linux-over-ssh.staticTokensManaged" -}}
+{{- range .Values.staticTokens -}}
+{{- if kindIs "map" . -}}
+{{- if not .existingSecret -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{/* Mount points inside the container. */}}
 {{- define "mcp-linux-over-ssh.paths" -}}
 config: /etc/mcp-linux-over-ssh/config.yaml
@@ -77,6 +100,7 @@ issuerCA: /etc/mcp-linux-over-ssh/issuer-ca/ca.pem
 kagentCA: /etc/mcp-linux-over-ssh/kagent-ca/ca.pem
 skillsInject: /etc/mcp-linux-over-ssh/skills/inject
 skillsConfigMaps: /etc/mcp-linux-over-ssh/skills/cm
+staticTokens: /etc/mcp-linux-over-ssh/static-tokens
 sshDir: /home/mcp/.ssh
 {{- end }}
 
@@ -115,11 +139,47 @@ which always renders, so a bad combination fails every install/template/lint.
 {{- fail "ssh.prompt_regex is required: a regular expression matching the remote shell's prompt" }}
 {{- end }}
 {{- if or (not .Values.ssh.idle_timeout) (has (toString .Values.ssh.idle_timeout) (list "0" "0s" "0m" "0h")) }}
-{{- fail "ssh.idle_timeout must be set and greater than zero (e.g. 30m): over HTTP nothing else ends a session whose agent has gone away" }}
+{{- fail "ssh.idle_timeout must be set and greater than zero (e.g. 30m): over HTTP nothing else ends a session whose caller has gone away" }}
 {{- end }}
 {{- if and .Values.gateway.enabled (not .Values.host) }}
 {{- fail "host must be set when gateway.enabled is true" }}
 {{- end }}
+{{- if and (not .Values.staticTokens) (not (include "mcp-linux-over-ssh.actorJwtEnabled" .)) }}
+{{- fail "no authentication: set staticTokens and/or enable actorJwt; this server does not serve /mcp anonymously" }}
+{{- end }}
+{{- $tokenNames := list }}
+{{- range $i, $tk := .Values.staticTokens }}
+{{- if not (kindIs "map" $tk) }}
+{{- fail (printf "staticTokens[%d] must be a map with name and existingSecret or token" $i) }}
+{{- end }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9_.]{0,61}[a-z0-9])?$" ($tk.name | default "")) }}
+{{- fail (printf "staticTokens[%d]: name %q must be lowercase letters, digits, '-', '_' or '.', at most 63" $i ($tk.name | default "")) }}
+{{- end }}
+{{- if has $tk.name $tokenNames }}
+{{- fail (printf "staticTokens: %q is listed twice" $tk.name) }}
+{{- end }}
+{{- $tokenNames = append $tokenNames $tk.name }}
+{{- range $k, $_ := $tk }}
+{{- if not (has $k (list "name" "existingSecret" "key" "token" "discoverOnly")) }}
+{{- fail (printf "staticTokens[%s]: unknown key %q (name, existingSecret, key, token, discoverOnly)" $tk.name $k) }}
+{{- end }}
+{{- end }}
+{{- if and $tk.existingSecret $tk.token }}
+{{- fail (printf "staticTokens[%s]: set existingSecret or token, not both" $tk.name) }}
+{{- end }}
+{{- if not (or $tk.existingSecret $tk.token) }}
+{{- fail (printf "staticTokens[%s]: set existingSecret (holding the token) or token" $tk.name) }}
+{{- end }}
+{{- if $tk.token }}
+{{- if lt (len ($tk.token | toString)) 32 }}
+{{- fail (printf "staticTokens[%s]: token must be at least 32 characters (openssl rand -hex 32)" $tk.name) }}
+{{- end }}
+{{- if eq (len (splitList "." ($tk.token | toString))) 3 }}
+{{- fail (printf "staticTokens[%s]: token looks like a JWT; use a random string (openssl rand -hex 32)" $tk.name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if include "mcp-linux-over-ssh.actorJwtEnabled" . }}
 {{- if and (not .Values.actorJwt.ca.clusterTrustBundle.enabled) (not .Values.actorJwt.ca.configMap.name) }}
 {{- fail "actorJwt needs the issuer's CA: enable actorJwt.ca.clusterTrustBundle or set actorJwt.ca.configMap.name" }}
 {{- end }}
@@ -130,6 +190,7 @@ which always renders, so a bad combination fails every install/template/lint.
 {{- $parts := splitList "/" . }}
 {{- if or (ne (len $parts) 2) (not (index $parts 0)) (not (index $parts 1)) }}
 {{- fail (printf "actorJwt.allowedAgents entry %q must be namespace/name" .) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- $skillNameRE := "^[a-z0-9]+(-[a-z0-9]+)*$" }}

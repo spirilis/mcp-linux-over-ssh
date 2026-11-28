@@ -1,7 +1,7 @@
 // Command mcp-linux-over-ssh is an MCP server (protocol 2026-07-28) that runs commands on
 // remote hosts through persistent SSH shell sessions. It speaks over stdio to the client
-// that launched it, or over HTTP to kagent agents that authenticate with an actor JWT; see
-// http.go for the second and for why it is never anonymous.
+// that launched it, or over HTTP to callers that present a static bearer token or, for kagent
+// agents, an actor JWT; see http.go for the second and for why it is never anonymous.
 //
 // Sessions are opened on demand by the start_session tool rather than at startup: the
 // target is chosen per connection from parameters the config declares, and several
@@ -38,7 +38,7 @@ import (
 
 const (
 	serverName    = "mcp-linux-over-ssh"
-	serverVersion = "0.5.0"
+	serverVersion = "0.5.1"
 
 	// listTTLMs is the cache hint on tools/list and resources/list. The library defaults
 	// it to five minutes, which suited a fixed catalog; the resource catalog now gains and
@@ -676,7 +676,7 @@ func instructions(requireConfirmation, parametric, gated, shared bool) string {
 		"Each session is one shell running one command at a time, so working directory and exported variables persist across calls on the same id and are independent between ids. " +
 		"If a session reports state \"awaiting_prompt\", or run_bash says the prompt regex has not matched, read that session's transcript resource to see what the shell printed and repair the pattern with tune_prompt_regex."
 	if shared {
-		s += " This server is shared: a session belongs to the conversation that opened it, list_sessions shows only yours, and nobody else can use or see one of yours. The session limit is the whole server's, so start_session can report it reached while you hold none — that clears as other callers finish, so wait rather than retry in a loop."
+		s += " This server is shared: a session belongs to the caller that opened it (your conversation, or your access token), list_sessions shows only yours, and nobody else can use or see one of yours. The session limit is the whole server's, so start_session can report it reached while you hold none — that clears as other callers finish, so wait rather than retry in a loop."
 	}
 	if requireConfirmation {
 		s += " Every run_bash call requires the caller to confirm the exact command via an elicitation round trip before it executes — clients must declare the elicitation capability."

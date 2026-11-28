@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -131,28 +132,62 @@ type httpServer struct {
 	url   string
 	idp   *issuer
 	agent *controller
+	mgr   *session.Manager
+}
+
+// Static tokens every test server accepts, beside actor JWTs unless staticOnly.
+var testStatic = []struct {
+	name     string
+	discover bool
+}{{"ci", false}, {"ci-2", false}, {"catalog", true}}
+
+func staticValue(name string) string { return name + "-0123456789abcdef0123456789abcdef" }
+
+type serverOpts struct {
+	allowed []string
+	// confirm turns ssh.require_confirmation on.
+	confirm bool
+	// staticOnly leaves actor_jwt out and builds authentication the way serveHTTP does.
+	staticOnly bool
 }
 
 // newHTTPServer assembles the http-mode stack and serves it. allowed is the agent allowlist.
 func newHTTPServer(t *testing.T, allowed ...string) *httpServer {
+	return newHTTPServerWith(t, serverOpts{allowed: allowed})
+}
+
+func newHTTPServerWith(t *testing.T, o serverOpts) *httpServer {
 	t.Helper()
 	idp := newIssuer(t)
+	dir := t.TempDir()
 
-	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	yaml := `server:
   mode: http
   http: {host: 127.0.0.1, port: 0}
-actor_jwt:
+static_tokens:
+`
+	for _, st := range testStatic {
+		file := filepath.Join(dir, st.name+".token")
+		if err := os.WriteFile(file, []byte(staticValue(st.name)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		yaml += fmt.Sprintf("  - {name: %s, token_file: %s, discover_only: %v}\n", st.name, file, st.discover)
+	}
+	if !o.staticOnly {
+		yaml += `actor_jwt:
   enabled: true
   issuer: ` + idp.srv.URL + `
   audience: ` + testAudience + `
   ca_file: ` + idp.caFile + `
-ssh:
+`
+	}
+	yaml += fmt.Sprintf(`ssh:
   command: "bash --norc --noprofile -i"
   prompt_regex: '\$ $'
   idle_timeout: 10m
-  require_confirmation: false
-`
+  require_confirmation: %v
+`, o.confirm)
+	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -162,20 +197,36 @@ ssh:
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	verifier, err := authn.NewActorVerifier(t.Context(), authn.ActorJWTConfig{
-		Issuer: cfg.ActorJWT.Issuer, Audience: cfg.ActorJWT.Audience, CAFile: cfg.ActorJWT.CAFile}, log)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctl := &controller{ids: map[string]authn.AgentIdentity{}}
-	auth, err := authn.New(authn.Options{Verifier: verifier, Resolver: ctl, AllowedAgents: allowed, Logger: log})
-	if err != nil {
-		t.Fatal(err)
+	var auth *authn.Authenticator
+	if o.staticOnly {
+		var closeAuth func()
+		if auth, closeAuth, err = buildAuthenticator(t.Context(), cfg, log); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(closeAuth)
+	} else {
+		verifier, err := authn.NewActorVerifier(t.Context(), authn.ActorJWTConfig{
+			Issuer: cfg.ActorJWT.Issuer, Audience: cfg.ActorJWT.Audience, CAFile: cfg.ActorJWT.CAFile}, log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := cfg.ReadStaticTokens()
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts := authn.Options{Verifier: verifier, Resolver: ctl, AllowedAgents: o.allowed, Logger: log}
+		for _, r := range read {
+			opts.StaticTokens = append(opts.StaticTokens, authn.StaticToken{Name: r.Name, Value: r.Value, DiscoverOnly: r.DiscoverOnly})
+		}
+		if auth, err = authn.New(opts); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	mgr := session.NewManager(cfg.SSH.MaxSessions, 0)
 	t.Cleanup(mgr.CloseAll)
-	handler, legacy, err := assemble(cfg, mgr, authenticatedOwner, false, nil)
+	handler, legacy, err := assemble(cfg, mgr, authenticatedOwner, cfg.SSH.RequireConfirmationValue(cfg.LegacyCompatEnabled()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,13 +236,15 @@ ssh:
 	}
 	srv := httptest.NewServer(root)
 	t.Cleanup(func() { _ = trans.Stop(); srv.Close() })
-	return &httpServer{t: t, url: srv.URL, idp: idp, agent: ctl}
+	return &httpServer{t: t, url: srv.URL, idp: idp, agent: ctl, mgr: mgr}
 }
 
 // caller is one conversation: an Agent, a kagent session, and the token its sandbox carries.
 type caller struct {
 	s     *httpServer
 	token string
+	// caps are the clientCapabilities a modern request declares; nil declares none.
+	caps map[string]any
 	// legacy is the Mcp-Session-Id of a pre-2026-07-28 handshake, when this caller is one.
 	legacy string
 }
@@ -204,6 +257,12 @@ func (s *httpServer) caller(agent, conversation string) *caller {
 	s.agent.ids[tok] = authn.AgentIdentity{Namespace: ns, Name: name, SessionID: conversation}
 	s.agent.mu.Unlock()
 	return &caller{s: s, token: tok}
+}
+
+// static is a caller holding one of testStatic's tokens. Two of them with the same name are
+// two holders of one token.
+func (s *httpServer) static(name string) *caller {
+	return &caller{s: s, token: staticValue(name)}
 }
 
 type rpcReply struct {
@@ -223,9 +282,13 @@ func (c *caller) post(method string, params map[string]any) rpcReply {
 	}
 	req, _ := http.NewRequest(http.MethodPost, c.s.url+"/mcp", nil)
 	if c.legacy == "" && method != "initialize" && method != "notifications/initialized" {
+		caps := c.caps
+		if caps == nil {
+			caps = map[string]any{}
+		}
 		params["_meta"] = map[string]any{
 			"io.modelcontextprotocol/protocolVersion":    mcp.ProtocolVersion,
-			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+			"io.modelcontextprotocol/clientCapabilities": caps,
 		}
 		req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
 		req.Header.Set("Mcp-Method", method)
@@ -249,7 +312,8 @@ func (c *caller) post(method string, params map[string]any) rpcReply {
 	if c.legacy != "" {
 		req.Header.Set("Mcp-Session-Id", c.legacy)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	// A timeout, so a request that wrongly reaches a long-lived stream fails rather than hangs.
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		c.s.t.Fatal(err)
 	}
@@ -411,10 +475,14 @@ func TestHTTPSessionsBelongToTheirCaller(t *testing.T) {
 
 	sameAgentLegacy := s.caller("kagent/helper", "conversation-3")
 	sameAgentLegacy.handshake()
+	staticLegacy := s.static("ci")
+	staticLegacy.handshake()
 	others := map[string]*caller{
 		"another agent":                           s.caller("kagent/other", "conversation-9"),
 		"the same agent, another conversation":    s.caller("kagent/helper", "conversation-2"),
 		"the same agent, another one, legacy era": sameAgentLegacy,
+		"a static token":                          s.static("ci"),
+		"a static token, legacy era":              staticLegacy,
 	}
 	for who, c := range others {
 		if l := c.tool("list_sessions", nil); l.Structured["count"] != float64(0) || strings.Contains(l.text(), id) {
@@ -653,10 +721,14 @@ func TestHTTPNotificationsStayWithTheirOwner(t *testing.T) {
 	sameAgent := s.caller("kagent/helper", "conversation-2")
 	legacy := s.caller("kagent/helper", "conversation-3")
 	legacy.handshake()
+	catalog := s.static("catalog")
+	catalog.handshake()
 	watchers := map[string]*stream{
-		"another agent":                        otherAgent.listen(status, transcript, never, index),
-		"the same agent, another conversation": sameAgent.listen(status, transcript, never, index),
-		"a legacy client's stream":             legacy.listen(),
+		"a discover-only token's legacy stream": catalog.listen(),
+		"a static token":                        s.static("ci").listen(status, transcript, never, index),
+		"another agent":                         otherAgent.listen(status, transcript, never, index),
+		"the same agent, another conversation":  sameAgent.listen(status, transcript, never, index),
+		"a legacy client's stream":              legacy.listen(),
 	}
 
 	// What each was granted. Someone else's session and a session that never existed must
@@ -666,7 +738,7 @@ func TestHTTPNotificationsStayWithTheirOwner(t *testing.T) {
 		t.Errorf("the owner was granted %v, want its own status URI and the index", got)
 	}
 	for who, st := range watchers {
-		if who == "a legacy client's stream" {
+		if strings.Contains(who, "legacy stream") || who == "a legacy client's stream" {
 			continue // the overlay swallows the acknowledgement; a legacy client never asked
 		}
 		eventually(t, who+"'s subscription to be acknowledged", func() bool { return st.ack() != nil })

@@ -351,6 +351,9 @@ func TestNewNeedsSomeAuthentication(t *testing.T) {
 	if _, err := New(Options{Verifier: newVerifier(t, idp, nil)}); err == nil {
 		t.Fatal("a verifier without a resolver was accepted")
 	}
+	if _, err := New(Options{Resolver: &fakeResolver{}, StaticTokens: []StaticToken{{Name: "ci", Value: staticTok}}}); err == nil {
+		t.Fatal("a resolver without a verifier was accepted")
+	}
 }
 
 func TestResolverNamesAreValidated(t *testing.T) {

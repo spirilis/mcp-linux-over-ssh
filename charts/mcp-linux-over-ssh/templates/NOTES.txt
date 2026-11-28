@@ -15,8 +15,15 @@
   renewed certificates are picked up without a restart.
 {{- end }}
 
-  Authentication: kagent agents only, by actor JWT. Anonymous requests to /mcp are refused.
-  Tokens are verified against {{ .Values.actorJwt.issuer }} (this cluster only).
+  Authentication: anonymous requests to /mcp are refused.
+{{- with .Values.staticTokens }}
+  Static tokens (checked first): {{ range $i, $tk := . }}{{ if $i }}, {{ end }}{{ $tk.name }}{{ if $tk.discoverOnly }} (discover-only){{ end }}{{ end }}.
+  A token is one caller: everyone holding it shares the sessions it opens. Each is mounted
+  by subPath, so a rotated token takes effect on the next restart:
+    kubectl -n {{ $ns }} rollout restart deployment/{{ $fullname }}
+{{- end }}
+{{- if include "mcp-linux-over-ssh.actorJwtEnabled" . }}
+  kagent agents, by actor JWT, verified against {{ .Values.actorJwt.issuer }} (this cluster only).
   Allowed agents: {{ if .Values.actorJwt.allowedAgents }}{{ join ", " .Values.actorJwt.allowedAgents }}{{ else }}NONE. Every agent is refused until actorJwt.allowedAgents is set.{{ end }}
   Create the RemoteMCPServer like this:
 
@@ -31,8 +38,11 @@
          audiences: ["{{ include "mcp-linux-over-ssh.actorAudience" . }}", "kagent-agent-info"]
          expirationSeconds: 900
 
-  kagent cannot list this server's tools in its UI (its control plane has no actor identity);
-  agents list them at run time.
+  kagent cannot list this server's tools in its UI (its control plane has no actor identity,
+  and cannot yet present a discover-only static token); agents list them at run time.
+{{- else }}
+  kagent agents (actorJwt) are not admitted.
+{{- end }}
 {{- if or .Values.skills.inject .Values.skills.configMaps }}
 
   Skills served:
@@ -83,4 +93,4 @@
 
   Local access:
     kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} 8080:{{ include "mcp-linux-over-ssh.servicePort" . }}
-    then POST MCP requests to {{ include "mcp-linux-over-ssh.scheme" . }}://localhost:8080/mcp (a valid actor JWT is still required)
+    then POST MCP requests to {{ include "mcp-linux-over-ssh.scheme" . }}://localhost:8080/mcp (a static token or actor JWT is still required)

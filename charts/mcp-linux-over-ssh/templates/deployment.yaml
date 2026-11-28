@@ -10,7 +10,7 @@ metadata:
 spec:
   # Always one, replaced rather than rolled. Every open session is a shell held
   # by this process, so a second pod would not know the session ids the first
-  # handed out, and two pods alive at once would answer the same agent with
+  # handed out, and two pods alive at once would answer the same caller with
   # two different sets of sessions.
   replicas: 1
   strategy:
@@ -29,6 +29,9 @@ spec:
         # Roll the pod when its configuration or its skills change: both are
         # read once, at startup.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if include "mcp-linux-over-ssh.staticTokensManaged" . }}
+        checksum/static-tokens: {{ include (print $.Template.BasePath "/static-tokens.yaml") . | sha256sum }}
+        {{- end }}
         {{- if .Values.skills.inject }}
         checksum/skills: {{ include (print $.Template.BasePath "/skills-configmap.yaml") . | sha256sum }}
         {{- end }}
@@ -95,12 +98,21 @@ spec:
               mountPath: {{ $p.config }}
               subPath: config.yaml
               readOnly: true
+            {{- if include "mcp-linux-over-ssh.actorJwtEnabled" . }}
             - name: issuer-ca
               mountPath: {{ dir $p.issuerCA }}
               readOnly: true
             {{- if .Values.actorJwt.kagentController.caConfigMap.name }}
             - name: kagent-ca
               mountPath: {{ dir $p.kagentCA }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- range $i, $tk := .Values.staticTokens }}
+            # subPath: fixed for the pod's life; a rotated token takes effect on restart.
+            - name: static-token-{{ $i }}
+              mountPath: {{ $p.staticTokens }}/{{ $tk.name }}
+              subPath: token
               readOnly: true
             {{- end }}
             {{- if .Values.tls.enabled }}
@@ -134,6 +146,7 @@ spec:
         - name: config
           configMap:
             name: {{ include "mcp-linux-over-ssh.fullname" . }}
+        {{- if include "mcp-linux-over-ssh.actorJwtEnabled" . }}
         - name: issuer-ca
           {{- if .Values.actorJwt.ca.clusterTrustBundle.enabled }}
           projected:
@@ -161,6 +174,16 @@ spec:
               - key: {{ .key }}
                 path: {{ base $p.kagentCA }}
         {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- $tokensSecret := include "mcp-linux-over-ssh.staticTokensSecretName" . }}
+        {{- range $i, $tk := .Values.staticTokens }}
+        - name: static-token-{{ $i }}
+          secret:
+            secretName: {{ $tk.existingSecret | default $tokensSecret }}
+            items:
+              - key: {{ if $tk.existingSecret }}{{ $tk.key | default "token" }}{{ else }}{{ $tk.name }}{{ end }}
+                path: token
         {{- end }}
         {{- if .Values.tls.enabled }}
         - name: serving-tls

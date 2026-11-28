@@ -1,0 +1,18 @@
+{{- /*
+Inline static tokens (staticTokens[].token). Tokens with existingSecret use that Secret instead.
+*/ -}}
+{{- if include "mcp-linux-over-ssh.staticTokensManaged" . }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "mcp-linux-over-ssh.staticTokensSecretName" . }}
+  labels:
+    {{- include "mcp-linux-over-ssh.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- range .Values.staticTokens }}
+  {{- if not .existingSecret }}
+  {{ .name }}: {{ .token | toString | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

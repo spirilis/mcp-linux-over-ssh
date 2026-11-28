@@ -2,7 +2,8 @@
 
 An MCP server (protocol `2026-07-28`) that runs commands on remote hosts through
 long-lived SSH shell sessions. It runs over stdio for the MCP client that launched it, or
-over HTTP as a service for [kagent](https://kagent.dev) agents — see
+over HTTP as a service for [kagent](https://kagent.dev) agents and anything holding a
+static bearer token — see
 [Serving agents over HTTP](#serving-agents-over-http).
 
 It's built for targets where the SSH command can only be run once — a PAM/PSM bastion
@@ -152,20 +153,44 @@ the flag the extension is not advertised at all.
 
 ## Serving agents over HTTP
 
-`server.mode: http` turns this into a long-running service for kagent agents.
+`server.mode: http` turns this into a long-running service for kagent agents, scripts and
+anything else that can send a bearer token.
 
-**It is never anonymous.** The only credential accepted is the Substrate actor JWT that
-kagent's egress gateway attaches for a `RemoteMCPServer` with `spec.actorJwt`: it is
-verified against the cluster's own issuer, resolved to the Agent it belongs to, and that
-Agent is checked against `actor_jwt.allowed_agents`. A request with no token gets `401`,
-an Agent that isn't listed gets `403`, and the server refuses to start in http mode
-without an `actor_jwt:` block. There is no static token, no OAuth, and no setting that
-opens it up.
+**It is never anonymous.** Two credentials are accepted, and the server refuses to start in
+http mode with neither:
 
-**Sessions belong to whoever opened them** — the Agent *and* the conversation. A caller
-can't list, run commands in, read the transcript of, or end a session someone else
-opened, including another conversation with the same Agent. `max_sessions` is still the
-whole server's, and `ssh.idle_timeout` is required so an abandoned session is collected.
+- **Static bearer tokens** (`static_tokens:`), for curl, scripts, CI and catalog UIs. Each
+  is named and read from its own file at start; it must be at least 32 characters
+  (`openssl rand -hex 32`) and must not look like a JWT. A `discover_only: true` token can
+  list tools, resources and skills and nothing else: every other call gets HTTP `403` with
+  JSON-RPC error `-32003`.
+- **Substrate actor JWTs** (`actor_jwt:`), which kagent's egress gateway attaches for a
+  `RemoteMCPServer` with `spec.actorJwt`: verified against the cluster's own issuer,
+  resolved to the Agent it belongs to, and that Agent checked against
+  `actor_jwt.allowed_agents`.
+
+A request with no token, or a wrong one, gets `401`; an Agent that isn't listed gets `403`.
+There is no OAuth and no setting that opens it up.
+
+```yaml
+static_tokens:
+  - name: ci                      # the caller is static:ci
+    token_file: /run/secrets/ci-token
+  - name: kagent-ui
+    token_file: /run/secrets/ui-token
+    discover_only: true
+```
+
+```
+curl -s https://bastion-mcp.example.com/mcp -H "Authorization: Bearer $(cat ci-token)" ...
+```
+
+**Sessions belong to whoever opened them.** For an agent that is the Agent *and* the
+conversation; for a static token it is the token. A caller can't list, run commands in,
+read the transcript of, or end a session someone else opened, including another
+conversation with the same Agent. Everyone holding one static token is one caller and
+shares its sessions, so give each script its own token. `max_sessions` is still the whole
+server's, and `ssh.idle_timeout` is required so an abandoned session is collected.
 
 TLS is optional and either place: a `tls:` block makes the process serve HTTPS itself
 (certificate files are re-read when they change, so cert-manager renewals and CSI-mounted
@@ -204,6 +229,14 @@ sshCredentials:
 actorJwt:
   allowedAgents: ["kagent/my-agent"]
 
+# Optional, beside or instead of actorJwt (set actorJwt.enabled: false for tokens only).
+staticTokens:
+  - name: ci
+    existingSecret: bastion-mcp-ci-token   # the token under key `token`
+  - name: kagent-ui
+    existingSecret: bastion-mcp-ui-token
+    discoverOnly: true
+
 skills:
   # Written into a ConfigMap as <name>/SKILL.md and served.
   inject:
@@ -220,6 +253,10 @@ skills:
 
 `frontmatter` is the skill's description — what tells a model when to reach for it. Give
 a map instead of a string to set other frontmatter keys.
+
+A static token can also be given inline as `token:` (the chart then creates the Secret);
+pass it with `--set-string`, never from a committed file. Tokens are mounted by subPath, so
+a rotated one takes effect when the pod restarts.
 
 The chart's notes print the matching `RemoteMCPServer`. Beyond that it can:
 

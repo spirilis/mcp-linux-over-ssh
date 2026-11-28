@@ -414,8 +414,8 @@ func TestChartShape(t *testing.T) {
 }
 
 // TestChartNamesNoOtherAuthentication keeps the chart honest about what the binary does: it
-// authenticates agents by actor JWT and nothing else, so no template or value may offer an
-// anonymous mode or an OAuth one.
+// authenticates by static token and actor JWT and nothing else, so no template or value may
+// offer an anonymous mode or an OAuth one.
 func TestChartNamesNoOtherAuthentication(t *testing.T) {
 	err := filepath.WalkDir(chartDir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
